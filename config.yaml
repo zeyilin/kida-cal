@@ -1,0 +1,34 @@
+# KIDA NYC → open-slots calendar config.
+# See docs/timely-api.md for service/staff ids.
+
+lookahead_days: 28
+timezone: America/New_York
+
+# Which stylists to include. Use "all" or a list of names (case-insensitive).
+# Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto (master barbers) · Hiroki (junior)
+stylists: all
+
+# Explicit service allowlist by NAME (case-insensitive substring match against the
+# live catalog). Default: haircut-type services only. Set to "all" to include everything.
+services:
+  - "Hair Cut"          # Hair Salon (Masa/Satomi/Nao) + Junior (Hiroki)
+  - "Haircut"           # Master Barber
+  - "Hair Cut & Beard Trim"
+  - "Haircut & Beard Shave"
+
+exclude_phone_only: true     # kids haircut / bang trim / keratin aren't bookable online anyway
+min_slot_hour: null          # e.g. 18 to only show evening slots (local hour, 0-23)
+weekends_only: false
+
+# Politeness / safety
+request_delay_seconds: 1.0
+max_requests_per_run: 1500
+cache_ttl_seconds: 900       # dev cache for identical (service,staff,month/day) reads
+
+# Google Calendar (Phase 2). Filled in on first run / stored out of band in CI.
+calendar_id: null
+calendar_name: "KIDA NYC — Open Slots"
+calendar_color_id: "5"       # a distinct color (banana/yellow)
+
+# Stable public booking link (no per-slot deep link exists — see docs/timely-api.md)
+booking_url: "https://bookings.gettimely.com/kidanyc/bb/book"

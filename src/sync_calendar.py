@@ -1,0 +1,212 @@
+"""
+Phase 2 — sync open slots to a dedicated Google Calendar (Route B / OAuth).
+
+Idempotent: each Event has a deterministic id (sha1 of stylist|start), so a slot maps
+to the same calendar event across runs. Each sync computes an insert/patch/delete diff
+against the calendar and applies the minimum changes:
+
+  in feed, not on calendar   -> insert
+  in feed and on calendar    -> patch if content changed
+  on calendar, not in feed   -> delete (it got booked)
+
+Safety: we only ever touch our own secondary calendar, never the primary. If the fetch
+did not clearly succeed (FetchResult.ok is False, e.g. every lookup 429'd), we SKIP all
+deletes so a transient outage can't wipe the calendar.
+
+Auth (Route B): OAuth desktop flow, scope calendar. Token cached at
+~/.config/kida-cal/token.json (and injected from a repo secret in CI). Never commit it.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from .fetch_availability import Config, FetchResult, fetch
+from .ics_export import event_description
+from .models import Event
+
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+LOCATION = "KIDA NYC, 369 Broome Street, New York, NY 10013"
+TOKEN_PATH = Path(os.path.expanduser("~/.config/kida-cal/token.json"))
+CLIENT_SECRET_ENV = "KIDA_GOOGLE_CLIENT_SECRET"   # path to client_secret.json
+
+
+# ---------------------------------------------------------------- auth / service
+def get_service():
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+
+    creds = None
+    if TOKEN_PATH.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            secret = os.environ.get(CLIENT_SECRET_ENV, "client_secret.json")
+            flow = InstalledAppFlow.from_client_secrets_file(secret, SCOPES)
+            creds = flow.run_local_server(port=0)
+        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TOKEN_PATH.write_text(creds.to_json())
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+
+def ensure_calendar(service, config: Config) -> str:
+    """Return the target calendar id, creating the secondary calendar on first run."""
+    if config.calendar_id:
+        return config.calendar_id
+    # Look for an existing calendar with our name before creating a duplicate.
+    page_token = None
+    while True:
+        cal_list = service.calendarList().list(pageToken=page_token).execute()
+        for entry in cal_list.get("items", []):
+            if entry.get("summary") == config.calendar_name:
+                return entry["id"]
+        page_token = cal_list.get("nextPageToken")
+        if not page_token:
+            break
+    created = service.calendars().insert(body={
+        "summary": config.calendar_name,
+        "timeZone": config.timezone,
+        "description": "Auto-generated mirror of KIDA NYC open booking slots. "
+                       "Read-only; confirm every slot on KIDA's site.",
+    }).execute()
+    return created["id"]
+
+
+# ---------------------------------------------------------------- event bodies
+def event_body(ev: Event, config: Config, notices: str, checked_at: datetime) -> dict:
+    return {
+        "id": ev.google_event_id(),
+        "summary": ev.summary(),
+        "location": LOCATION,
+        "description": event_description(ev, notices, checked_at),
+        "start": {"dateTime": ev.start.isoformat(), "timeZone": config.timezone},
+        "end": {"dateTime": ev.end.isoformat(), "timeZone": config.timezone},
+        "transparency": "transparent",          # shows as Free
+        "reminders": {"useDefault": False, "overrides": []},  # no notifications
+        "colorId": str(config.calendar_color_id),
+        "source": {"title": "Book on KIDA NYC", "url": ev.book_url},
+    }
+
+
+def _needs_patch(existing: dict, desired: dict) -> bool:
+    for k in ("summary", "description", "location", "transparency", "colorId"):
+        if existing.get(k) != desired.get(k):
+            return True
+    for k in ("start", "end"):
+        if (existing.get(k, {}).get("dateTime") != desired[k]["dateTime"]):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- diff + apply
+def sync(config: Config, result: FetchResult, service=None, dry_run=False) -> dict:
+    tz = ZoneInfo(config.timezone)
+    checked_at = datetime.now(tz)
+    desired = {ev.google_event_id(): event_body(ev, config, result.notices, checked_at)
+               for ev in result.events}
+
+    stats = {"insert": 0, "patch": 0, "delete": 0, "unchanged": 0, "skipped_delete": 0}
+
+    if dry_run and service is None:
+        # No API access: just report what we'd publish.
+        stats["insert"] = len(desired)
+        print(f"[dry-run] would publish {len(desired)} events "
+              f"(no calendar access to diff against)")
+        for ev in list(result.events)[:10]:
+            print(f"  INSERT {ev.start:%a %m-%d %H:%M} {ev.summary()}")
+        if len(result.events) > 10:
+            print(f"  ... and {len(result.events) - 10} more")
+        return stats
+
+    cal_id = ensure_calendar(service, config)
+
+    # Load our existing events (only ones we created carry the 'kida' id prefix).
+    existing: dict[str, dict] = {}
+    page_token = None
+    while True:
+        resp = service.events().list(
+            calendarId=cal_id, showDeleted=False, singleEvents=True,
+            maxResults=2500, pageToken=page_token).execute()
+        for item in resp.get("items", []):
+            if item["id"].startswith("kida"):
+                existing[item["id"]] = item
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    # inserts / patches
+    for eid, body in desired.items():
+        if eid not in existing:
+            stats["insert"] += 1
+            if not dry_run:
+                service.events().insert(calendarId=cal_id, body=body).execute()
+        elif _needs_patch(existing[eid], body):
+            stats["patch"] += 1
+            if not dry_run:
+                service.events().patch(calendarId=cal_id, eventId=eid, body=body).execute()
+        else:
+            stats["unchanged"] += 1
+
+    # deletes — but NEVER when the fetch was suspicious (guard against mass-wipe)
+    stale = [eid for eid in existing if eid not in desired]
+    if not result.ok:
+        stats["skipped_delete"] = len(stale)
+        print(f"WARNING: fetch not ok (ok={result.lookups_ok} failed={result.lookups_failed}); "
+              f"skipping {len(stale)} deletes to avoid wiping the calendar")
+    else:
+        for eid in stale:
+            stats["delete"] += 1
+            if not dry_run:
+                service.events().delete(calendarId=cal_id, eventId=eid).execute()
+
+    return stats
+
+
+# ---------------------------------------------------------------- CLI
+def main():
+    ap = argparse.ArgumentParser(description="Sync KIDA NYC open slots to Google Calendar")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the insert/patch/delete diff without writing")
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--ics", default=None, help="also write an .ics file to this path")
+    args = ap.parse_args()
+
+    config = Config.load(args.config)
+    result = fetch(config)
+    print(f"fetched: ok={result.ok} lookups ok={result.lookups_ok} "
+          f"failed={result.lookups_failed} → {len(result.events)} events")
+
+    if args.ics:
+        from . import ics_export
+        ics_export.write(args.ics, result.events, result.notices,
+                         datetime.now(ZoneInfo(config.timezone)))
+        print(f"wrote {args.ics}")
+
+    service = None
+    if not args.dry_run or TOKEN_PATH.exists() or os.environ.get(CLIENT_SECRET_ENV):
+        try:
+            service = get_service()
+        except Exception as e:
+            if args.dry_run:
+                print(f"(no calendar credentials: {e}; dry-run will report inserts only)")
+            else:
+                raise
+
+    stats = sync(config, result, service=service, dry_run=args.dry_run)
+    print(("[dry-run] " if args.dry_run else "") + "sync: " +
+          " ".join(f"{k}={v}" for k, v in stats.items()))
+
+    # Fail loudly for CI if auth/shape broke and we got nothing while not in dry-run.
+    if not args.dry_run and not result.ok:
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

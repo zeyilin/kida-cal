@@ -1,0 +1,7 @@
+# Extra deps for the OPTIONAL Google Calendar API path (src/sync_calendar.py).
+# The default .ics feed path does NOT need these.
+-r requirements.txt
+google-api-python-client>=2.100
+google-auth>=2.23
+google-auth-oauthlib>=1.1
+google-auth-httplib2>=0.1

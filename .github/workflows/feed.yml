@@ -1,0 +1,49 @@
+name: publish-ics-feed
+
+# Default deployment: build the .ics hourly and publish it to GitHub Pages so it has
+# a stable public URL you can subscribe to in Google Calendar ("From URL"). $0/mo on
+# a public repo. No Google credentials required.
+
+on:
+  schedule:
+    - cron: "0 * * * *"      # top of every hour (UTC). Note: Google re-fetches the
+                             # subscribed URL on ITS own slow schedule (often 8–24h).
+  workflow_dispatch: {}
+
+# GitHub Pages deploy needs these.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build .ics feed
+        # Exits non-zero (without writing) if the fetch failed, so a bad run can't
+        # publish an empty feed — the previous Pages deployment stays live.
+        run: python -m src.build_feed --out public/open_slots.ics
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

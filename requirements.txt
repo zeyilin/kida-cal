@@ -1,0 +1,4 @@
+# Fetcher + .ics feed (the URL-subscribe path — no Google credentials needed)
+requests>=2.31
+PyYAML>=6.0
+tzdata>=2024.1            # ensures zoneinfo has America/New_York on all platforms

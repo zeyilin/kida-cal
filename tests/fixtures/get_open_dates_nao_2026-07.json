@@ -1,0 +1,74 @@
+{
+  "firstOpenDate": "2026-07-19",
+  "firstAvailableDate": "2026-07-19",
+  "openDates": [
+    {
+      "day": "2026-07-19",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": false
+    },
+    {
+      "day": "2026-07-20",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-07-21",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-07-23",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-07-25",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-07-26",
+      "isAvailableMorning": false,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-07-27",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-07-28",
+      "isAvailableMorning": false,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-07-30",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-08-01",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-08-02",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-08-03",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    },
+    {
+      "day": "2026-08-04",
+      "isAvailableMorning": true,
+      "isAvailableAfternoon": true
+    }
+  ],
+  "customerTimeZoneTodaysDate": "2026-07-17",
+  "debugInfo": null,
+  "iterationCount": 0
+}

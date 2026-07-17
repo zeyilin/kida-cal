@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+token.json
+client_secret*.json
+credentials.json
+*.pem
+
+# Local editor/agent settings
+.claude/
+
+# Caches / build
+.cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Generated output kept intentionally? The .ics keepalive is committed by CI;
+# ignore local scratch copies elsewhere.
+/scratch/

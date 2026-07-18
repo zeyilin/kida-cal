@@ -13,8 +13,15 @@ Safety: we only ever touch our own secondary calendar, never the primary. If the
 did not clearly succeed (FetchResult.ok is False, e.g. every lookup 429'd), we SKIP all
 deletes so a transient outage can't wipe the calendar.
 
-Auth (Route B): OAuth desktop flow, scope calendar. Token cached at
-~/.config/kida-cal/token.json (and injected from a repo secret in CI). Never commit it.
+Auth: two supported methods, selected automatically —
+  1. Service account (preferred for unattended CI): set KIDA_SERVICE_ACCOUNT_JSON to the
+     path of the SA key file. The target calendar must be shared with the SA's email with
+     "Make changes to events". No token expiry. Requires config.calendar_id / KIDA_CALENDAR_ID
+     (a service account can't create a calendar in your account).
+  2. OAuth desktop (local/interactive): token cached at ~/.config/kida-cal/token.json,
+     minted from client_secret.json (KIDA_GOOGLE_CLIENT_SECRET). Publish the OAuth app to
+     avoid the 7-day refresh-token expiry if you use this in CI.
+Never commit the SA key or token.
 """
 from __future__ import annotations
 
@@ -31,15 +38,29 @@ from .models import Event
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 LOCATION = "KIDA NYC, 369 Broome Street, New York, NY 10013"
 TOKEN_PATH = Path(os.path.expanduser("~/.config/kida-cal/token.json"))
-CLIENT_SECRET_ENV = "KIDA_GOOGLE_CLIENT_SECRET"   # path to client_secret.json
+CLIENT_SECRET_ENV = "KIDA_GOOGLE_CLIENT_SECRET"       # path to client_secret.json (OAuth)
+SERVICE_ACCOUNT_ENV = "KIDA_SERVICE_ACCOUNT_JSON"     # path to service-account key (preferred)
+
+
+def using_service_account() -> bool:
+    return bool(os.environ.get(SERVICE_ACCOUNT_ENV))
 
 
 # ---------------------------------------------------------------- auth / service
 def get_service():
+    from googleapiclient.discovery import build
+
+    sa_path = os.environ.get(SERVICE_ACCOUNT_ENV)
+    if sa_path:
+        # Preferred path: service account. No browser, no token refresh dance.
+        from google.oauth2 import service_account
+        creds = service_account.Credentials.from_service_account_file(sa_path, scopes=SCOPES)
+        return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+    # Fallback: OAuth desktop flow with a cached, refreshable token.
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
 
     creds = None
     if TOKEN_PATH.exists():
@@ -57,10 +78,21 @@ def get_service():
 
 
 def ensure_calendar(service, config: Config) -> str:
-    """Return the target calendar id, creating the secondary calendar on first run."""
-    if config.calendar_id:
-        return config.calendar_id
-    # Look for an existing calendar with our name before creating a duplicate.
+    """Return the target calendar id.
+
+    Resolution order: KIDA_CALENDAR_ID env → config.calendar_id → (OAuth only) find-or-create
+    a secondary calendar by name. A service account cannot create a calendar in your account,
+    so it MUST be given an explicit id (of a calendar you created and shared with it).
+    """
+    cal_id = os.environ.get("KIDA_CALENDAR_ID") or config.calendar_id
+    if cal_id:
+        return cal_id
+    if using_service_account():
+        raise SystemExit(
+            "Service-account auth requires an explicit calendar id. Create a calendar, share "
+            "it with the service account's email ('Make changes to events'), and set "
+            "KIDA_CALENDAR_ID (or config.calendar_id).")
+    # OAuth only: look for an existing calendar with our name before creating a duplicate.
     page_token = None
     while True:
         cal_list = service.calendarList().list(pageToken=page_token).execute()
@@ -190,7 +222,8 @@ def main():
         print(f"wrote {args.ics}")
 
     service = None
-    if not args.dry_run or TOKEN_PATH.exists() or os.environ.get(CLIENT_SECRET_ENV):
+    if (not args.dry_run or using_service_account()
+            or TOKEN_PATH.exists() or os.environ.get(CLIENT_SECRET_ENV)):
         try:
             service = get_service()
         except Exception as e:

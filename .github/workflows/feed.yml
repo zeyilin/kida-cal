@@ -5,10 +5,12 @@ name: publish-ics-feed
 # a public repo. No Google credentials required.
 
 on:
-  schedule:
-    - cron: "0 * * * *"      # top of every hour (UTC). Note: Google re-fetches the
-                             # subscribed URL on ITS own slow schedule (often 8–24h).
+  # Manual only. The live Google Calendar API path (sync.yml) is now the scheduled one;
+  # running both hourly would double-hit Timely. This .ics feed remains a credential-free
+  # fallback you can rebuild on demand. Re-enable the cron below to use the feed instead.
   workflow_dispatch: {}
+  # schedule:
+  #   - cron: "0 * * * *"     # Google re-fetches a subscribed .ics URL slowly (~8–24h).
 
 # GitHub Pages deploy needs these.
 permissions:

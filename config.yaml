@@ -25,7 +25,10 @@ request_delay_seconds: 1.0
 max_requests_per_run: 1500
 cache_ttl_seconds: 900       # dev cache for identical (service,staff,month/day) reads
 
-# Google Calendar (Phase 2). Filled in on first run / stored out of band in CI.
+# Google Calendar (live API path). With service-account auth the calendar id is REQUIRED
+# (a service account can't create a calendar in your account): set it here for local use,
+# or via the KIDA_CALENDAR_ID env/secret in CI (env wins). Get it from the calendar's
+# Settings → Integrate calendar → Calendar ID.
 calendar_id: null
 calendar_name: "KIDA NYC — Open Slots"
 calendar_color_id: "5"       # a distinct color (banana/yellow)

@@ -3,6 +3,8 @@
 token.json
 client_secret*.json
 credentials.json
+sa-key.json
+*service-account*.json
 *.pem
 
 # Local editor/agent settings

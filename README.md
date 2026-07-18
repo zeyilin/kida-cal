@@ -1,80 +1,90 @@
 # KIDA NYC — Open Slots calendar
 
 A read-only calendar that mirrors **available** hair/barber appointment slots at
-[KIDA NYC](https://kidanyc.com) for the next N days, publishing them as a **subscribable
-`.ics` URL** you add to Google Calendar. Each slot is a **Free**, no-notification event
-prefixed `OPEN ·`, with a booking link in the description. It **never books, holds, or
-cancels anything** — it only reads public availability.
+[KIDA NYC](https://kidanyc.com) for the next N days as a **live Google Calendar** you can
+add (and share via a public link). Each slot is a **Free**, no-notification event prefixed
+`OPEN ·`, with a booking link in the description. It **never books, holds, or cancels
+anything** — it only reads public availability.
 
 > Availability is a snapshot; every event says so and links to KIDA's booking page to confirm.
 
 ## Two ways to consume it
 
-| | **A. Subscribe by URL (default)** | **B. Google Calendar API (optional)** |
+| | **A. Live Google Calendar (default)** | **B. Subscribe by `.ics` URL (fallback)** |
 |---|---|---|
-| How | Publishes a public `.ics` at a GitHub Pages URL; you add it via "From URL" | Writes events straight into a calendar in your account |
-| Setup | Just make the repo public + enable Pages. **No Google login.** | One-time Google OAuth + repo secrets |
-| Freshness | **Google re-fetches on its own slow schedule (~8–24h)** | Updates within the hour |
+| How | Writes events into a Google Calendar via the API; shareable via a public Google link | Publishes a public `.ics` at a GitHub Pages URL; add via "From URL" |
+| Setup | Google service account + share a calendar with it (one-time) | Just make the repo public + enable Pages. **No Google login.** |
+| Freshness | **Within the hour** (native Google sync) | **Google re-fetches on its own slow schedule (~8–24h)** |
 | Cost | $0/mo | $0/mo |
 
-You asked for **A** — that's what's set up by default (`.github/workflows/feed.yml`).
-**B** stays available as the low-latency option (`.github/workflows/sync.yml`) if the
-refresh lag bugs you later.
+**A is the live path and the default** (`.github/workflows/sync.yml`, hourly). **B**
+stays available as a credential-free fallback (`.github/workflows/feed.yml`, manual) — same
+data, just slower to update.
 
 ## How it works
 
 ```
 config.yaml ─▶ src/fetch_availability.py ─▶ [Slot] ─▶ group ─▶ [Event]
                      │  (src/timely.py funnel)                    │
-                     │                                            ├─(A)▶ src/build_feed.py ─▶ public/open_slots.ics ─▶ GitHub Pages URL
-                     └▶ kidanyc.com notices                       └─(B)▶ src/sync_calendar.py ─▶ Google Calendar API
+                     │                                            ├─(A)▶ src/sync_calendar.py ─▶ Google Calendar API (live)
+                     └▶ kidanyc.com notices                       └─(B)▶ src/build_feed.py ─▶ public/open_slots.ics ─▶ GitHub Pages URL
 ```
 
 Hourly, GitHub Actions reads KIDA's live availability by walking Timely's booking funnel
 from a plain HTTP client (no browser — see `docs/timely-api.md`), normalizes each opening
-into a timezone-aware slot, de-dupes overlapping services, and regenerates the `.ics`.
+into a timezone-aware slot, de-dupes overlapping services, then (A) reconciles the events
+into a Google Calendar (insert/patch/delete) or (B) regenerates the `.ics`.
 
-## Setup — Path A (subscribe by URL)
+## Setup — Path A (live Google Calendar) — default
 
-1. **Make the repo public** (public repos get unlimited free Actions minutes → $0/mo).
-2. **Enable GitHub Pages:** repo **Settings → Pages → Build and deployment → Source: GitHub Actions**.
-3. **Run the workflow:** Actions tab → **publish-ics-feed** → *Run workflow* (it also runs hourly).
-   It publishes the calendar to:
+Uses a **Google service account** so the hourly job can write unattended (no token expiry).
+The credential/account steps below are done by **you** in Google's UI — this tool never
+signs in as you.
+
+**1. Google Cloud (one-time, free, no billing):**
+   - Create a project → **APIs & Services** → enable the **Google Calendar API**.
+   - **Credentials → Create credentials → Service account** → create it, then **Keys → Add
+     key → JSON** and download the key file. Note the service account's **email**
+     (`…@….iam.gserviceaccount.com`).
+
+**2. Create + share the calendar (in Google Calendar):**
+   - **Settings → Add calendar → Create new calendar**, name it **"KIDA NYC — Open Slots"**.
+   - Open its settings → **Share with specific people** → add the service account's email
+     with **"Make changes to events"** (least privilege).
+   - For a public link: **Access permissions → Make available to public** (read-only), then
+     **Get shareable link** → this is your live-calendar link
+     (`https://calendar.google.com/calendar/u/0?cid=<id>`).
+   - **Settings → Integrate calendar → Calendar ID** — copy it.
+
+**3. Try it locally:**
+   ```bash
+   python3 -m venv .venv && .venv/bin/pip install -r requirements-calendar.txt
+   KIDA_SERVICE_ACCOUNT_JSON=sa-key.json KIDA_CALENDAR_ID='<calendar-id>' \
+     .venv/bin/python -m src.sync_calendar --dry-run     # insert/patch/delete diff
+   # drop --dry-run to actually write; events appear within ~1 min
    ```
-   https://<your-user>.github.io/<repo-name>/open_slots.ics
-   ```
-4. **Subscribe in Google Calendar:** on desktop, next to **Other calendars** click **+**
-   → **From URL** → paste that URL → **Add calendar**.
 
-That's it — no credentials anywhere.
+**4. Deploy (hourly, $0):** add repo **secrets** `KIDA_SERVICE_ACCOUNT_JSON` (paste the
+   key file's contents) and `KIDA_CALENDAR_ID`. `.github/workflows/sync.yml` runs hourly.
+   Kick it off once via **Actions → sync-open-slots → Run workflow**.
 
-> **Freshness caveat:** Google controls how often it re-reads a subscribed URL — commonly
-> every several hours to a day. We regenerate hourly, but Google won't pull that fast, so a
-> just-booked slot can linger in your view for a while. If that matters, use Path B.
+Share the `cid` link from step 2 with anyone — for logged-in Google users it adds as a
+native calendar that updates within the hour.
 
-### Try it locally
+## Setup — Path B (subscribe by `.ics` URL) — fallback
+
+Credential-free, but Google re-reads external `.ics` URLs slowly (~8–24h).
+
+1. Make the repo public; **Settings → Pages → Source: GitHub Actions**.
+2. **Actions → publish-ics-feed → Run workflow** (manual; re-enable its cron to auto-run).
+   Publishes to `https://<user>.github.io/<repo>/open_slots.ics`.
+3. Google Calendar → **Other calendars → + → From URL** → paste → **Add calendar**.
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt
 .venv/bin/python -m src.build_feed --out public/open_slots.ics   # writes the .ics
 .venv/bin/python -m src.fetch_availability                       # just print what's open
 ```
-
-## Setup — Path B (Google Calendar API, optional, faster)
-
-Needs `pip install -r requirements-calendar.txt` and a one-time Google **Desktop app**
-OAuth client (no billing account). Authorize once locally:
-
-```bash
-KIDA_GOOGLE_CLIENT_SECRET=client_secret.json \
-  .venv/bin/python -m src.sync_calendar --dry-run
-```
-
-This creates the **"KIDA NYC — Open Slots"** calendar and never touches your primary one.
-For CI, add repo secrets `KIDA_TOKEN_JSON` + `KIDA_CLIENT_SECRET_JSON`, then enable the
-schedule in `sync.yml` (and disable `feed.yml` so Timely isn't hit twice). Credential steps
-(creating the OAuth client, signing in, granting consent) are done by **you** in Google's
-UI — this tool never enters your Google password.
 
 ## Configuration
 
@@ -93,9 +103,9 @@ implying one-click booking. See `docs/timely-api.md`.
 
 - **Read-only.** No booking, no PII, no account creation. ~1 req/sec, backoff on 429/5xx,
   hard per-run request cap.
-- **No empty-feed wipe on failure.** If a run's fetch doesn't clearly succeed, `build_feed`
-  exits non-zero **without** writing, so the previously published feed stays live (Path B
-  likewise skips all deletes). A transient outage can't blank your calendar.
+- **No wipe on failure.** If a run's fetch doesn't clearly succeed, the calendar sync
+  **skips all deletes** (and `build_feed` exits without writing), so a transient outage
+  can't blank your calendar. Verified by a unit test.
 - **DST-correct.** All times are tz-aware `America/New_York`, unit-tested across the
   Nov 1 2026 fall-back.
 - If Timely serves a CAPTCHA or blocks the client, the run fails loudly. See `docs/compliance.md`.

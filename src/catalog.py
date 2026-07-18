@@ -18,13 +18,12 @@ STAFF = {
     "287218": "Masa",
     "367833": "Satomi",
     "175308": "Nao",
-    # Master barbers — real names are Sachi / Taka (Aki) / Yohei / Fausto; the exact
-    # id↔name pairing isn't pinned, so they show generically as "Master Barber".
-    "24102": "Master Barber",
-    "173532": "Master Barber",
-    "24107": "Master Barber",
-    "24105": "Master Barber",
-    "24104": "Master Barber",
+    # Master barbers (pinned from the staff-selection "with <Name>" labels).
+    "24102": "Sachi",
+    "173532": "Taka (Aki)",
+    "24107": "Yohei",
+    "24105": "Fausto",
+    "24104": "Shin",
     "686999": "Hiroki",
 }
 

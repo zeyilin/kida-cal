@@ -173,8 +173,8 @@ $60 for a Haircut).
 
 ### Barber Shop / Master Barber (staff: 24102, 173532, 24107, 24105, 24104)
 
-Names seen on the staff page: **Sachi, Taka (Aki), Yohei, Fausto** (+ one more of
-the five ids — exact id↔name pairing to be nailed in Phase 1).
+Names (pinned from the staff-selection "with <Name>" labels): **Sachi** (24102),
+**Taka (Aki)** (173532), **Yohei** (24107), **Fausto** (24105), **Shin** (24104).
 
 | serviceId | name | duration | price |
 |---|---|---|---|
@@ -206,10 +206,14 @@ the five ids — exact id↔name pairing to be nailed in Phase 1).
 | 287218 | Masa | Stylist |
 | 367833 | Satomi | Stylist |
 | 175308 | Nao | Stylist |
-| 24102 / 173532 / 24107 / 24105 / 24104 | Sachi, Taka (Aki), Yohei, Fausto, (+1) | Master Barber |
+| 24102 | Sachi | Master Barber |
+| 173532 | Taka (Aki) | Master Barber |
+| 24107 | Yohei | Master Barber |
+| 24105 | Fausto | Master Barber |
+| 24104 | Shin | Master Barber |
 | 686999 | Hiroki | Junior Barber |
 
-The plan's example stylist "Shin" does **not** appear in the current roster — use the
+("Shin" from the plan is real — a master barber, id 24104.) Use the
 ids above, not hardcoded names from the plan.
 
 ---

@@ -1,0 +1,52 @@
+name: keepalive
+
+# Keeps the scheduled workflows from being auto-disabled. GitHub pauses scheduled
+# workflows after ~60 days with no repository activity — and crucially, commits made
+# with the built-in GITHUB_TOKEN do NOT count as activity. So this pushes a weekly
+# empty commit authenticated with a user Personal Access Token, which DOES count and
+# resets the timer for every scheduled workflow in the repo (including this one).
+#
+# Setup: create a fine-grained PAT scoped to THIS repo with Contents: Read and write,
+# and add it as the secret KIDA_KEEPALIVE_PAT. See README. Until it's set, this no-ops.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"     # weekly, Monday 06:17 UTC — far inside the 60-day window
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PAT
+        id: cfg
+        env:
+          PAT: ${{ secrets.KIDA_KEEPALIVE_PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "::notice::KIDA_KEEPALIVE_PAT not set — add a fine-grained PAT to enable keepalive. See README."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout with PAT
+        if: steps.cfg.outputs.ok == 'true'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.KIDA_KEEPALIVE_PAT }}
+
+      - name: Push empty keepalive commit
+        if: steps.cfg.outputs.ok == 'true'
+        run: |
+          git config user.name "kida-cal-keepalive"
+          git config user.email "actions@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive $(date -u +%Y-%m-%d)"
+          git push

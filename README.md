@@ -71,6 +71,14 @@ signs in as you.
 Share the `cid` link from step 2 with anyone — for logged-in Google users it adds as a
 native calendar that updates within the hour.
 
+**Keep the schedule alive.** GitHub auto-disables scheduled workflows after ~60 days with
+no repository activity — and commits by the Actions bot don't count. `keepalive.yml`
+pushes a weekly empty commit that *does* count, using a **fine-grained Personal Access
+Token**. To enable it: create a fine-grained PAT scoped to **this repo only**, with
+**Contents: Read and write**, and add it as the secret **`KIDA_KEEPALIVE_PAT`**. Until
+that secret exists the keepalive safely no-ops (and you'd just re-enable the workflow
+manually if GitHub ever pauses it).
+
 ## Setup — Path B (subscribe by `.ics` URL) — fallback
 
 Credential-free, but Google re-reads external `.ics` URLs slowly (~8–24h).

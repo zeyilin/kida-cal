@@ -1,7 +1,7 @@
 # KIDA NYC → open-slots calendar config.
 # See docs/timely-api.md for service/staff ids.
 
-lookahead_days: 28
+lookahead_days: 90
 timezone: America/New_York
 
 # Which stylists to include. Use "all" or a list of names (case-insensitive).
@@ -18,7 +18,7 @@ weekends_only: false
 
 # Politeness / safety
 request_delay_seconds: 1.0
-max_requests_per_run: 1500
+max_requests_per_run: 6000     # 90-day × all services × all staff needs headroom
 cache_ttl_seconds: 900       # dev cache for identical (service,staff,month/day) reads
 
 # Google Calendar (live API path). With service-account auth the calendar id is REQUIRED

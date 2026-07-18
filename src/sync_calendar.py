@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -44,6 +45,29 @@ SERVICE_ACCOUNT_ENV = "KIDA_SERVICE_ACCOUNT_JSON"     # path to service-account 
 
 def using_service_account() -> bool:
     return bool(os.environ.get(SERVICE_ACCOUNT_ENV))
+
+
+def _execute(request, *, tries=6):
+    """Run a Google API request, backing off on rate-limit / transient errors.
+
+    A large first sync (rewriting all events + inserting the 90-day backlog) can burst
+    past Google's per-100-seconds write limit; this retries instead of failing the run.
+    """
+    from googleapiclient.errors import HttpError
+    backoff = 1.5
+    for attempt in range(tries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            reason = str(e).lower()
+            transient = status in (429, 500, 502, 503) or (
+                status == 403 and ("rate" in reason or "quota" in reason))
+            if transient and attempt < tries - 1:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            raise
 
 
 # ---------------------------------------------------------------- auth / service
@@ -95,29 +119,29 @@ def ensure_calendar(service, config: Config) -> str:
     # OAuth only: look for an existing calendar with our name before creating a duplicate.
     page_token = None
     while True:
-        cal_list = service.calendarList().list(pageToken=page_token).execute()
+        cal_list = _execute(service.calendarList().list(pageToken=page_token))
         for entry in cal_list.get("items", []):
             if entry.get("summary") == config.calendar_name:
                 return entry["id"]
         page_token = cal_list.get("nextPageToken")
         if not page_token:
             break
-    created = service.calendars().insert(body={
+    created = _execute(service.calendars().insert(body={
         "summary": config.calendar_name,
         "timeZone": config.timezone,
         "description": "Auto-generated mirror of KIDA NYC open booking slots. "
                        "Read-only; confirm every slot on KIDA's site.",
-    }).execute()
+    }))
     return created["id"]
 
 
 # ---------------------------------------------------------------- event bodies
-def event_body(ev: Event, config: Config, notices: str, checked_at: datetime) -> dict:
+def event_body(ev: Event, config: Config, notices: str) -> dict:
     return {
         "id": ev.google_event_id(),
         "summary": ev.summary(),
         "location": LOCATION,
-        "description": event_description(ev, notices, checked_at),
+        "description": event_description(ev, notices),
         "start": {"dateTime": ev.start.isoformat(), "timeZone": config.timezone},
         "end": {"dateTime": ev.end.isoformat(), "timeZone": config.timezone},
         "transparency": "transparent",          # shows as Free
@@ -139,9 +163,7 @@ def _needs_patch(existing: dict, desired: dict) -> bool:
 
 # ---------------------------------------------------------------- diff + apply
 def sync(config: Config, result: FetchResult, service=None, dry_run=False) -> dict:
-    tz = ZoneInfo(config.timezone)
-    checked_at = datetime.now(tz)
-    desired = {ev.google_event_id(): event_body(ev, config, result.notices, checked_at)
+    desired = {ev.google_event_id(): event_body(ev, config, result.notices)
                for ev in result.events}
 
     stats = {"insert": 0, "patch": 0, "delete": 0, "unchanged": 0, "skipped_delete": 0}
@@ -163,9 +185,9 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False) -> di
     existing: dict[str, dict] = {}
     page_token = None
     while True:
-        resp = service.events().list(
+        resp = _execute(service.events().list(
             calendarId=cal_id, showDeleted=False, singleEvents=True,
-            maxResults=2500, pageToken=page_token).execute()
+            maxResults=2500, pageToken=page_token))
         for item in resp.get("items", []):
             if item["id"].startswith("kida"):
                 existing[item["id"]] = item
@@ -178,11 +200,11 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False) -> di
         if eid not in existing:
             stats["insert"] += 1
             if not dry_run:
-                service.events().insert(calendarId=cal_id, body=body).execute()
+                _execute(service.events().insert(calendarId=cal_id, body=body))
         elif _needs_patch(existing[eid], body):
             stats["patch"] += 1
             if not dry_run:
-                service.events().patch(calendarId=cal_id, eventId=eid, body=body).execute()
+                _execute(service.events().patch(calendarId=cal_id, eventId=eid, body=body))
         else:
             stats["unchanged"] += 1
 
@@ -196,7 +218,7 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False) -> di
         for eid in stale:
             stats["delete"] += 1
             if not dry_run:
-                service.events().delete(calendarId=cal_id, eventId=eid).execute()
+                _execute(service.events().delete(calendarId=cal_id, eventId=eid))
 
     return stats
 

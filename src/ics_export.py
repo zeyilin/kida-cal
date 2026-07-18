@@ -38,7 +38,7 @@ def _utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def event_description(ev: Event, notices: str, checked_at: datetime) -> str:
+def event_description(ev: Event, notices: str) -> str:
     lines = []
     if len(ev.services) > 1:
         lines.append("Bookable as: " + ", ".join(ev.services))
@@ -50,8 +50,8 @@ def event_description(ev: Event, notices: str, checked_at: datetime) -> str:
     lines.append(f"Book: {ev.book_url}")
     if notices:
         lines.append(f"Salon notice: {notices}")
-    lines.append(f"Last checked: {checked_at:%Y-%m-%d %H:%M %Z}. "
-                 "This is a snapshot — the slot may already be gone; confirm on KIDA's site.")
+    lines.append("Snapshot of open availability — the slot may already be gone; "
+                 "confirm on KIDA's site.")
     return "\n".join(lines)
 
 
@@ -71,7 +71,7 @@ def render(events: list[Event], notices: str, checked_at: datetime,
             f"DTSTART:{_utc(ev.start)}",
             f"DTEND:{_utc(ev.end)}",
             _fold("SUMMARY:" + _esc(ev.summary())),
-            _fold("DESCRIPTION:" + _esc(event_description(ev, notices, checked_at))),
+            _fold("DESCRIPTION:" + _esc(event_description(ev, notices))),
             _fold("LOCATION:" + _esc(location)),
             _fold("URL:" + _esc(ev.book_url)),
             "TRANSP:TRANSPARENT",

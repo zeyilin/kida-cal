@@ -10,7 +10,10 @@ name: sync-open-slots
 
 on:
   schedule:
-    - cron: "0 * * * *"       # top of every hour (UTC)
+    # Every 6 hours. A 90-day sweep across all services/staff is a long, request-heavy
+    # run (~1h at 1 req/sec), so hourly would be near-continuous and impolite to Timely.
+    # Far-out availability changes slowly; near-term cancellations still surface within 6h.
+    - cron: "0 */6 * * *"
   workflow_dispatch: {}        # manual "Run workflow" button
 
 # Never run two syncs at once (they'd race on the same events).

@@ -10,10 +10,11 @@ name: sync-open-slots
 
 on:
   schedule:
-    # Every 6 hours. A 90-day sweep across all services/staff is a long, request-heavy
-    # run (~1h at 1 req/sec), so hourly would be near-continuous and impolite to Timely.
-    # Far-out availability changes slowly; near-term cancellations still surface within 6h.
-    - cron: "0 */6 * * *"
+    # Hourly. Most hours do a fast near-term sweep (next ~3 weeks) so cancellations
+    # surface within the hour. Every 6th hour (00/06/12/18 UTC) does the full 90-day
+    # sweep — that one is ~1h and request-heavy, so it can't run every hour without
+    # Timely rate-limiting us. Delete logic is window-scoped so the two don't fight.
+    - cron: "0 * * * *"
   workflow_dispatch: {}        # manual "Run workflow" button
 
 # Never run two syncs at once (they'd race on the same events).
@@ -58,11 +59,21 @@ jobs:
           KIDA_SERVICE_ACCOUNT_JSON_CONTENT: ${{ secrets.KIDA_SERVICE_ACCOUNT_JSON }}
         run: printf '%s' "$KIDA_SERVICE_ACCOUNT_JSON_CONTENT" > sa-key.json
 
+      - name: Pick lookahead depth
+        if: steps.cfg.outputs.configured == 'true'
+        id: depth
+        run: |
+          H=$(date -u +%H)
+          if [ $((10#$H % 6)) -eq 0 ]; then D=90; else D=21; fi
+          echo "days=$D" >> "$GITHUB_OUTPUT"
+          echo "::notice::Lookahead this run: $D days"
+
       - name: Sync calendar
         if: steps.cfg.outputs.configured == 'true'
         env:
           KIDA_SERVICE_ACCOUNT_JSON: sa-key.json
           KIDA_CALENDAR_ID: ${{ secrets.KIDA_CALENDAR_ID }}
+          KIDA_LOOKAHEAD_DAYS: ${{ steps.depth.outputs.days }}
         run: python -m src.sync_calendar
 
       - name: Clean up secret on runner

@@ -1,6 +1,8 @@
 # KIDA NYC → open-slots calendar config.
 # See docs/timely-api.md for service/staff ids.
 
+# Deep-sweep window. The hourly workflow overrides this to a shorter near-term window
+# (KIDA_LOOKAHEAD_DAYS) most hours, and uses this full 90 days every 6th hour.
 lookahead_days: 90
 timezone: America/New_York
 

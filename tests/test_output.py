@@ -69,3 +69,44 @@ def test_sync_skips_deletes_when_fetch_failed():
     assert stats["delete"] == 0
     assert stats["skipped_delete"] == 1
     assert svc._ev.deleted == []       # nothing actually deleted
+
+
+def test_window_scoped_delete_protects_far_out_events():
+    """A short near-term run must delete stale in-window events but NOT the deep run's
+    far-out events (so the hourly + 6-hourly sweeps can share one calendar)."""
+    from datetime import timedelta
+    cfg = Config.load(os.path.join(os.path.dirname(__file__), "..", "config.yaml"))
+    cfg.calendar_id = "cal123"
+    cfg.lookahead_days = 21
+    now = datetime.now(NY)
+    near = (now + timedelta(days=5)).isoformat()      # inside the 21-day window
+    far = (now + timedelta(days=40)).isoformat()      # beyond it (deep run's territory)
+
+    class FakeEvents:
+        def __init__(self): self.deleted = []
+        def list(self, **k):
+            class R:
+                def execute(self_):
+                    return {"items": [
+                        {"id": "kidaNEAR", "summary": "OPEN · near",
+                         "start": {"dateTime": near}, "end": {"dateTime": near}},
+                        {"id": "kidaFAR", "summary": "OPEN · far",
+                         "start": {"dateTime": far}, "end": {"dateTime": far}}]}
+            return R()
+        def delete(self, **k):
+            self.deleted.append(k.get("eventId"))
+            class R:
+                def execute(self_): return {}
+            return R()
+
+    class FakeService:
+        def __init__(self): self._ev = FakeEvents()
+        def events(self): return self._ev
+    svc = FakeService()
+
+    # Successful fetch with NO events (everything "booked"). Only the in-window one
+    # should be pruned; the far-out one is left for the deep sweep.
+    good = FetchResult(slots=[], events=[], notices="", ok=True, lookups_ok=5, lookups_failed=0)
+    stats = sync_calendar.sync(cfg, good, service=svc, dry_run=False)
+    assert svc._ev.deleted == ["kidaNEAR"]
+    assert stats["delete"] == 1

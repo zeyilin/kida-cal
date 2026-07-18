@@ -13,6 +13,7 @@ the caller must NOT mass-delete calendar events in that case.
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -57,6 +58,10 @@ class Config:
         for k, v in data.items():
             setattr(c, k, v)
         c.raw = data
+        # Per-run override (used by the hourly near-term vs 6-hourly deep sweeps).
+        env_look = os.environ.get("KIDA_LOOKAHEAD_DAYS")
+        if env_look:
+            c.lookahead_days = int(env_look)
         return c
 
 

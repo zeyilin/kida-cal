@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -208,8 +208,21 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False) -> di
         else:
             stats["unchanged"] += 1
 
-    # deletes — but NEVER when the fetch was suspicious (guard against mass-wipe)
-    stale = [eid for eid in existing if eid not in desired]
+    # deletes — window-scoped so a short near-term run can't wipe the deep run's
+    # far-out events. Only prune events whose start is within THIS run's lookahead
+    # window (this also cleans past events); leave far-future and unparseable ones.
+    tz = ZoneInfo(config.timezone)
+    horizon = datetime.now(tz) + timedelta(days=config.lookahead_days)
+
+    def _start(item):
+        s = item.get("start", {}).get("dateTime")
+        try:
+            return datetime.fromisoformat(s) if s else None
+        except ValueError:
+            return None
+
+    stale = [eid for eid, item in existing.items()
+             if eid not in desired and (_start(item) is not None and _start(item) <= horizon)]
     if not result.ok:
         stats["skipped_delete"] = len(stale)
         print(f"WARNING: fetch not ok (ok={result.lookups_ok} failed={result.lookups_failed}); "

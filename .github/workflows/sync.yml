@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write             # for the keepalive commit of open_slots.ics
+  contents: read
 
 jobs:
   sync:
@@ -55,28 +55,17 @@ jobs:
           KIDA_SERVICE_ACCOUNT_JSON_CONTENT: ${{ secrets.KIDA_SERVICE_ACCOUNT_JSON }}
         run: printf '%s' "$KIDA_SERVICE_ACCOUNT_JSON_CONTENT" > sa-key.json
 
-      - name: Sync calendar + regenerate .ics
+      - name: Sync calendar
         if: steps.cfg.outputs.configured == 'true'
         env:
           KIDA_SERVICE_ACCOUNT_JSON: sa-key.json
           KIDA_CALENDAR_ID: ${{ secrets.KIDA_CALENDAR_ID }}
-        run: python -m src.sync_calendar --ics open_slots.ics
-
-      - name: Keepalive commit of open_slots.ics
-        if: steps.cfg.outputs.configured == 'true'
-        # Doubles as (1) a fallback .ics and (2) repo activity so the scheduled workflow
-        # isn't auto-disabled after ~60 days of inactivity.
-        run: |
-          git config user.name "kida-cal-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add open_slots.ics
-          if git diff --cached --quiet; then
-            echo "no slot changes this run"
-          else
-            git commit -m "chore: refresh open slots ($(date -u +%Y-%m-%dT%H:%MZ))"
-            git push
-          fi
+        run: python -m src.sync_calendar
 
       - name: Clean up secret on runner
         if: always()
         run: rm -f sa-key.json
+
+# Note: GitHub disables scheduled workflows after ~60 days with no repository activity
+# (Actions-bot commits don't count). If that happens GitHub emails you — click
+# "Enable workflow", or push any commit, to resume.

@@ -8,13 +8,9 @@ timezone: America/New_York
 # Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto (master barbers) · Hiroki (junior)
 stylists: all
 
-# Explicit service allowlist by NAME (case-insensitive substring match against the
-# live catalog). Default: haircut-type services only. Set to "all" to include everything.
-services:
-  - "Hair Cut"          # Hair Salon (Masa/Satomi/Nao) + Junior (Hiroki)
-  - "Haircut"           # Master Barber
-  - "Hair Cut & Beard Trim"
-  - "Haircut & Beard Shave"
+# Service allowlist by NAME (case-insensitive substring), or "all" for every online
+# service (cuts, color, highlights, blowout, beard work, deep conditioner, …).
+services: all
 
 exclude_phone_only: true     # kids haircut / bang trim / keratin aren't bookable online anyway
 min_slot_hour: null          # e.g. 18 to only show evening slots (local hour, 0-23)

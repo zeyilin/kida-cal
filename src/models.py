@@ -58,10 +58,26 @@ class Event:
         raw = f"{self.stylist_id}|{self.start.isoformat()}"
         return "kida" + hashlib.sha1(raw.encode()).hexdigest()
 
+    def primary_service(self) -> str:
+        """The service shown in the title. A slot usually supports several services;
+        prefer a haircut so the title reads 'Haircut w/ Sachi', not the alphabetically
+        first option like 'Beard Shave'. Full list still shows in the description."""
+        if not self.services:
+            return "Appointment"
+
+        def rank(name: str):
+            n = name.strip().lower()
+            if n in ("hair cut", "haircut"):     # the plain full haircut
+                return (0, len(name), name)
+            if "cut" in n:                       # other cut variants / combos
+                return (1, len(name), name)
+            return (2, len(name), name)          # beard-only, color, blowout, etc.
+
+        return min(self.services, key=rank)
+
     def summary(self) -> str:
-        primary = self.services[0] if self.services else "Appointment"
         role = f" ({self.stylist_role})" if self.stylist_role else ""
-        return f"OPEN · {primary} w/ {self.stylist}{role}"
+        return f"OPEN · {self.primary_service()} w/ {self.stylist}{role}"
 
 
 def group_slots(slots: list[Slot]) -> list[Event]:

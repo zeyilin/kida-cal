@@ -15,7 +15,12 @@ on:
     # sweep — that one is ~1h and request-heavy, so it can't run every hour without
     # Timely rate-limiting us. Delete logic is window-scoped so the two don't fight.
     - cron: "0 * * * *"
-  workflow_dispatch: {}        # manual "Run workflow" button
+  workflow_dispatch:           # manual "Run workflow" button
+    inputs:
+      full:
+        description: "Full 90-day sweep (not just the near-term window)"
+        type: boolean
+        default: false
 
 # Never run two syncs at once (they'd race on the same events).
 concurrency:
@@ -64,7 +69,11 @@ jobs:
         id: depth
         run: |
           H=$(date -u +%H)
-          if [ $((10#$H % 6)) -eq 0 ]; then D=90; else D=21; fi
+          if [ "${{ github.event.inputs.full }}" = "true" ] || [ $((10#$H % 6)) -eq 0 ]; then
+            D=90
+          else
+            D=21
+          fi
           echo "days=$D" >> "$GITHUB_OUTPUT"
           echo "::notice::Lookahead this run: $D days"
 

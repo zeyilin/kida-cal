@@ -98,6 +98,20 @@ def test_group_slots_merges_overlapping_services():
     assert ev.google_event_id().startswith("kida")
 
 
+def test_title_prefers_haircut():
+    from src.models import Event
+    open_slot = dict(stylist_id="24102", stylist="Sachi", stylist_role="Master Barber",
+                     start=datetime(2026, 8, 1, 15, 0, tzinfo=NY),
+                     end=datetime(2026, 8, 1, 15, 30, tzinfo=NY))
+    ev = Event(services=["Beard Shave (Razor)", "Beard Trim", "Buzz", "Haircut",
+                         "Portion Haircut"], **open_slot)
+    assert ev.primary_service() == "Haircut"
+    assert ev.summary() == "OPEN · Haircut w/ Sachi (Master Barber)"
+    # A slot that genuinely only fits beard services still titles honestly.
+    ev2 = Event(services=["Beard Shave (Razor)", "Beard Trim"], **open_slot)
+    assert "Haircut" not in ev2.summary()
+
+
 def test_group_slots_distinct_starts_stay_separate():
     a = build_datetime("2026-07-20", 540, NY)
     b = build_datetime("2026-07-20", 600, NY)

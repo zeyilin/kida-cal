@@ -24,10 +24,11 @@ import yaml
 
 from . import timely
 from .cache import ResponseCache
-from .catalog import service_meta, staff_name
+from .catalog import SERVICES, service_meta, staff_name
 from .models import Event, Slot, group_slots
 
 KIDANYC_HOME = "https://kidanyc.com/"
+_KNOWN_IDS = set(SERVICES)   # service ids we have price/deposit enrichment for
 
 
 @dataclass
@@ -219,10 +220,6 @@ def fetch(config: Config, tz: ZoneInfo | None = None) -> FetchResult:
     ok = ok_count > 0 and fail_count <= ok_count
     return FetchResult(slots=slots, events=events, notices=notices, ok=ok,
                        lookups_ok=ok_count, lookups_failed=fail_count, errors=errors)
-
-
-from .catalog import SERVICES as _CAT
-_KNOWN_IDS = set(_CAT.keys())
 
 
 if __name__ == "__main__":

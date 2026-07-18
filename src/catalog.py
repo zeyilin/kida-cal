@@ -1,6 +1,6 @@
 """
-Static enrichment for KIDA NYC services & staff, derived from Phase 0 recon
-(docs/timely-api.md, 2026-07-17).
+Static enrichment for KIDA NYC services & staff, derived from recon
+(docs/timely-api.md).
 
 The availability API returns service ids, staff ids, and times — but NOT prices or
 deposit terms. This module supplies those. The fetcher still parses the live service
@@ -18,7 +18,8 @@ STAFF = {
     "287218": "Masa",
     "367833": "Satomi",
     "175308": "Nao",
-    # Master barbers — exact id↔name pairing not fully pinned in Phase 0.
+    # Master barbers — real names are Sachi / Taka (Aki) / Yohei / Fausto; the exact
+    # id↔name pairing isn't pinned, so they show generically as "Master Barber".
     "24102": "Master Barber",
     "173532": "Master Barber",
     "24107": "Master Barber",

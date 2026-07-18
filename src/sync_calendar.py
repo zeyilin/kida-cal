@@ -1,5 +1,5 @@
 """
-Phase 2 — sync open slots to a dedicated Google Calendar (Route B / OAuth).
+Sync open slots into a dedicated Google Calendar (the live path).
 
 Idempotent: each Event has a deterministic id (sha1 of stylist|start), so a slot maps
 to the same calendar event across runs. Each sync computes an insert/patch/delete diff

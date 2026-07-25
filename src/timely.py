@@ -6,7 +6,9 @@ required. One TimelyClient instance == one HTTP session (its own cookie jar), so
 a fresh client per service (service is baked into the session; staff/date are params).
 
 Politeness: a shared request delay, exponential backoff on 429/5xx, and a hard per-run
-request cap enforced across all clients via a module-level counter.
+request cap enforced across all clients via a module-level counter. When the host asks us
+to back off for longer than we are willing to sleep, or keeps 429ing, we stop the run and
+report rather than grinding — see docs/compliance.md.
 """
 from __future__ import annotations
 
@@ -22,8 +24,17 @@ import requests
 BASE = "https://book.gettimely.com"
 EMBED = BASE + "/kidanyc/book/embed?client-login=true"
 TZ_ID = 80  # Timely tz id for America/New_York
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-      "kida-cal/0.1 (+personal read-only availability mirror)")
+# Honest, self-identifying UA. We do not impersonate a browser (docs/compliance.md).
+UA = "kida-cal/0.2 (+personal read-only availability mirror; contact via repo issues)"
+
+# If Timely asks us to wait longer than this, stop the run instead of sleeping through it.
+# The next cron tick will retry. Sleeping on an unbounded Retry-After let a single response
+# hold the job open for hours.
+MAX_RETRY_AFTER_SECONDS = 120
+# Consecutive fully-throttled REQUESTS (each having already spent all 5 retries) across the
+# whole run that mean "we are not welcome right now". Must stay above the retry-loop length
+# so that a single stubborn url cannot end the sweep on its own.
+MAX_CONSECUTIVE_THROTTLES = 3
 
 _OBG_RE = re.compile(r"/Booking/Service\?obg=([0-9a-f-]{36})")
 _SERVICE_RE = re.compile(
@@ -32,10 +43,26 @@ _SERVICE_RE = re.compile(
 _SERVICE_STAFF_RE = re.compile(
     r'name="(ServiceStaffIds\[\d+:SV\])"\s+[^>]*value="([^"]*)"')
 _BOOKING_SELECTION_RE = re.compile(r'name="BookingSelection"[^>]*value="([^"]+)"')
+# Sentinels proving a gettimeslots response really is the day partial, not a changed page,
+# an error, a login interstitial or an empty body. Any ONE of them is enough.
+# IsStaffRequested is the strongest: it appears in both the populated and the empty
+# captured fixtures, so it marks the endpoint rather than the outcome.
+_STAFF_FIELD_RE = re.compile(r'name="IsStaffRequested"', re.I)
+_NO_TIMES_RE = re.compile(r"no times? (?:are )?available", re.I)
+_DAY_HEADER_RE = re.compile(r"<h3[^>]*>[^<]*\d", re.I)
 
 
 class TimelyError(RuntimeError):
     """Raised when the funnel shape is not what recon documented (fail loudly)."""
+
+
+class BudgetExhausted(TimelyError):
+    """The per-run request cap or the throttle stop-condition tripped.
+
+    This is NOT a per-lookup failure: it means the rest of the run's data is missing, so
+    callers must re-raise it past their per-lookup `except Exception` handlers instead of
+    laundering it into a failure count that still reports the fetch as healthy.
+    """
 
 
 @dataclass
@@ -54,20 +81,38 @@ class _Budget:
         self.made = 0
         self.cap = 10_000
         self.delay = 1.0
+        self.throttles = 0        # consecutive 429s seen this run
         self._last = 0.0
 
     def configure(self, cap: int, delay: float):
         self.cap = cap
         self.delay = delay
+        # Reset the counters too: a long-lived process (or a test calling fetch twice)
+        # would otherwise inherit the previous run's spend and trip the cap immediately.
+        self.made = 0
+        self.throttles = 0
 
     def tick(self):
         if self.made >= self.cap:
-            raise TimelyError(f"request cap reached ({self.cap}); aborting to stay polite")
+            raise BudgetExhausted(
+                f"request cap reached ({self.cap}) — the rest of this run's availability was "
+                f"never fetched. Raise max_requests_per_run only if that is genuinely safe.")
         wait = self.delay - (time.monotonic() - self._last)
         if wait > 0:
             time.sleep(wait)
         self._last = time.monotonic()
         self.made += 1
+
+    def throttled(self):
+        """One fully-throttled REQUEST (all retries spent on 429s), not one attempt."""
+        self.throttles += 1
+        if self.throttles >= MAX_CONSECUTIVE_THROTTLES:
+            raise BudgetExhausted(
+                f"{self.throttles} consecutive throttled requests from Timely — stopping "
+                f"this run as the documented stop condition requires. Next run will retry.")
+
+    def cleared(self):
+        self.throttles = 0
 
 
 BUDGET = _Budget()
@@ -119,7 +164,15 @@ def decode_booking_selection(value: str) -> RawSlot | None:
         return None
 
 
-def parse_time_slots(partial_html: str) -> list[RawSlot]:
+def parse_time_slots(partial_html: str, *, strict: bool = True) -> list[RawSlot]:
+    """Decode the bookable openings in a gettimeslots partial.
+
+    `strict` guards the failure mode that silently empties the calendar: if Timely changes
+    this partial's markup, every regex misses and we return [] — indistinguishable from a
+    genuinely fully-booked day, and the sync would then delete real availability. So an
+    empty result is only believed when the response still *looks* like the empty-day
+    response we captured (a day header and/or the apology line).
+    """
     slots, seen = [], set()
     for value in _BOOKING_SELECTION_RE.findall(partial_html):
         rs = decode_booking_selection(value)
@@ -130,7 +183,27 @@ def parse_time_slots(partial_html: str) -> list[RawSlot]:
             continue
         seen.add(key)
         slots.append(rs)
+    if not slots and strict and not _looks_like_empty_day(partial_html):
+        at_endpoint = bool(_STAFF_FIELD_RE.search(partial_html))
+        raise TimelyError(
+            "gettimeslots returned neither bookable slots nor a recognizable empty-day "
+            f"response ({len(partial_html)} bytes, "
+            f"{'right endpoint — slot markup changed' if at_endpoint else 'not the slots partial at all'}). "
+            "Refusing to report this as 'no availability'.")
     return slots
+
+
+def _looks_like_empty_day(html: str) -> bool:
+    """Does this response positively assert 'this day has no openings'?
+
+    Only OUTCOME-specific markers count. `IsStaffRequested` deliberately does NOT appear
+    here: it is the first line of the *populated* fixture too, so accepting it would mean
+    accepting any response from this endpoint — including one whose slot markup changed
+    out from under our regex, which is the exact failure this guard exists to catch.
+    It is used separately, as a precondition, to tell "right endpoint, no slots" apart
+    from "wrong page entirely".
+    """
+    return bool(_NO_TIMES_RE.search(html) or _DAY_HEADER_RE.search(html))
 
 
 class TimelyClient:
@@ -157,17 +230,36 @@ class TimelyClient:
             BUDGET.tick()
             resp = self.session.request(method, url, data=data, headers=headers, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504):
+                retry_after = None
+                raw = resp.headers.get("Retry-After")
+                if raw:
+                    try:
+                        retry_after = float(raw)
+                    except ValueError:
+                        retry_after = None
+                # An over-long Retry-After is a stop condition on ANY status that carries
+                # one, not just 429. A 503 with Retry-After: 3600 is what a Cloudflare
+                # overload/rate-limit page looks like, and clamping that down to 120s would
+                # mean retrying four times sooner than we were asked to — the opposite of
+                # what docs/compliance.md promises.
+                if retry_after is not None and retry_after > MAX_RETRY_AFTER_SECONDS:
+                    raise BudgetExhausted(
+                        f"{resp.status_code} from {url} with Retry-After: {retry_after:.0f}s "
+                        f"(> {MAX_RETRY_AFTER_SECONDS}s). Stopping rather than holding the "
+                        f"job open or retrying sooner than asked; the next run will retry.")
                 if attempt == 4:
+                    if resp.status_code == 429:
+                        # Count the exhausted REQUEST, not each attempt: incrementing per
+                        # attempt made a single stubborn url trip the run-wide stop
+                        # condition by itself, and made this branch unreachable for 429.
+                        BUDGET.throttled()
                     raise TimelyError(f"{resp.status_code} from {url} after retries")
-                retry_after = resp.headers.get("Retry-After")
-                try:
-                    wait = max(backoff, float(retry_after)) if retry_after else backoff
-                except ValueError:
-                    wait = backoff
+                wait = max(backoff, retry_after) if retry_after is not None else backoff
                 time.sleep(wait)
                 backoff *= 2
                 continue
             resp.raise_for_status()
+            BUDGET.cleared()
             text = resp.text
             if cache_key and self.cache:
                 self.cache.put(cache_key, text)
@@ -199,9 +291,19 @@ class TimelyClient:
         text = self._request("GET", url, xhr=True,
                              cache_key=f"od:{self.cache_ns}:{staff_id}:{year}-{month}")
         try:
-            return json.loads(text).get("openDates", [])
+            data = json.loads(text)
         except json.JSONDecodeError:
             raise TimelyError(f"GetOpenDates did not return JSON for staff {staff_id}")
+        # A present-but-empty openDates is legitimate (that month is fully booked). A
+        # MISSING key is a shape change, and silently reading it as "no open days" would
+        # skip every gettimeslots call — so the strict slot parser never runs, every lookup
+        # "succeeds" with zero data, and the calendar gets emptied.
+        if not isinstance(data, dict) or "openDates" not in data:
+            raise TimelyError(
+                f"GetOpenDates response has no 'openDates' key for staff {staff_id} "
+                f"({sorted(data)[:8] if isinstance(data, dict) else type(data).__name__}) "
+                f"— the API shape changed.")
+        return data["openDates"]
 
     def time_slots(self, staff_id: str, date_iso: str) -> list[RawSlot]:
         url = (f"{BASE}/booking/gettimeslots/?obg={self.obg}&dateSelected={date_iso}"

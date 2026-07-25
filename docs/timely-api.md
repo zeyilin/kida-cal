@@ -266,8 +266,12 @@ Phase 0's job is to pick A/B/C. The deciding facts:
   `recon/capture.py` is already 90% of the fetcher.
 - OAuth token + calendar id live in **repo secrets**; keep the Free plan's $0 spend
   limit so nothing can ever bill.
-- Mitigate the 60-day scheduled-workflow auto-disable with a keepalive commit (e.g.
-  commit the regenerated `.ics`).
+- Mitigate the 60-day scheduled-workflow auto-disable with real repository activity.
+  (Implemented as `.github/dependabot.yml`. A "keepalive empty commit" workflow was
+  tried first and is **not** recommended: it needs a PAT because commits made with the
+  built-in `GITHUB_TOKEN` do not reset the clock, and if that PAT is ever missing the
+  workflow reports success while doing nothing — which is exactly what happened here.
+  Dependabot needs no secret and produces reviewable PRs as a side effect.)
 
 ### Route A (Apps Script) — possible, but risk-flagged
 

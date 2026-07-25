@@ -117,6 +117,15 @@ class Event:
         return int((self.end - self.start).total_seconds() // 60)
 
     @property
+    def opening_count(self) -> int:
+        """How many bookable openings this entry represents. Always 1 for an Event.
+
+        Entry COUNT is not comparable across event_style — blocks are ~3x fewer by design —
+        so anything sizing one style's output against the other's must compare openings,
+        not entries."""
+        return 1
+
+    @property
     def services(self) -> list[str]:
         return [o.name for o in self.options]
 
@@ -180,6 +189,10 @@ class Block:
     @property
     def book_url(self) -> str:
         return self.openings[0].book_url
+
+    @property
+    def opening_count(self) -> int:
+        return len(self.openings)
 
     @property
     def options(self) -> list[ServiceOption]:

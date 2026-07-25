@@ -592,19 +592,26 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     # entries are still standing. Doing this first — as the delete pass — meant an abort left
     # the public calendar emptied with nothing written back.
     if obsolete_in_window and not blocked:
-        landed = stats["insert"] + stats["revive"] + stats["patch"] + stats["unchanged"]
+        landed_entries = stats["insert"] + stats["revive"] + stats["patch"] + stats["unchanged"]
+        # Size the replacement set in OPENINGS, never in entries. The two styles encode the
+        # same availability at very different entry counts (~3.3x on real data), so counting
+        # entries would refuse a perfectly healthy slots->blocks changeover — and would wave
+        # through a blocks->slots one that had lost most of its data.
+        covered = sum(e.opening_count for e in entries)
         if (not allow_mass_delete
-                and landed < DELETE_BLAST_RADIUS * len(obsolete_in_window)):
+                and covered < DELETE_BLAST_RADIUS * len(obsolete_in_window)):
             # The replacement set is implausibly small next to what we are about to remove.
             # This is the shape of a partial fetch on a changeover run, which would
             # otherwise wipe the calendar and still exit 0.
             stats["blocked_delete"] += len(obsolete_in_window)
             print(f"::error::refusing to retire {len(obsolete_in_window)} entries from the "
-                  f"previous event_style: only {landed} replacement entries were written. "
-                  f"Fix the fetch first, or re-run with --allow-mass-delete.")
+                  f"previous event_style: the {landed_entries} replacement entries written "
+                  f"cover only {covered} openings. Fix the fetch first, or re-run with "
+                  f"--allow-mass-delete.")
         else:
             print(f"retiring {len(obsolete_in_window)} entries from the previous "
-                  f"event_style ({landed} replacements are live)")
+                  f"event_style ({landed_entries} entries covering {covered} openings "
+                  f"are live)")
             for eid in obsolete_in_window:
                 do_delete(eid, "migrated")
 

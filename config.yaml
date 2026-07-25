@@ -18,15 +18,18 @@ timezone: America/New_York
 #           exact bookable start times listed in the description. On real captured data:
 #           418 openings -> 126 entries, and the busiest day drops from 41 to 10.
 #
-# Deliberately on `slots` for now. This is a staged rollout: the 409 fix and the delete
-# guards ship first with ZERO visual change, so "is the outage fixed?" can be answered
-# before "do I like the new layout?". Flip to `blocks` in a separate commit once a clean
-# run has been observed.
+# Staged rollout complete: the 409 fix shipped on `slots` first and was confirmed live
+# (revive=3 then revive=1, 169 stale bookings cleared, 60/60 lookups), so switching the
+# layout can now be judged on its own.
 #
 # Switching is safe in either direction: entries written in the other style are recognised
 # by their id prefix and retired only AFTER their replacements are live, only within this
-# run's window, and only when enough replacements actually landed.
-event_style: slots
+# run's window, and only when the replacements cover enough OPENINGS — never enough
+# entries, since blocks encode the same availability in ~3.3x fewer of them.
+#
+# Do the changeover on a DEEP run (--depth full). A near-tier run would only convert the
+# next 21 days and leave 22-90 out as slots until the next deep sweep.
+event_style: blocks
 
 # Which stylists to include. Use "all" or a list of names (case-insensitive).
 # Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto (master barbers) · Hiroki (junior)

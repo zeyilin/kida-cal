@@ -56,6 +56,20 @@ def _existing_from(ev, config, notices=""):
     return dict(body, status="confirmed")
 
 
+# --------------------------------------------------------------- suite self-check
+def test_every_style_parametrized_test_actually_uses_its_parameter():
+    """Twice now, a test has declared @parametrize("style", ...) and then built its config
+    without threading the parameter through — running the same case twice and reporting two
+    passes. That is precisely how a calendar-wiping bug stayed invisible to a 90-test suite,
+    so the suite checks itself."""
+    import re
+    src = open(__file__, encoding="utf-8").read()
+    blind = [m.group(1) for m in re.finditer(
+        r'@pytest\.mark\.parametrize\("style".*?\ndef (\w+)\(style\):\n((?:    .*\n|\n)+?)(?=\n\n|\Z)',
+        src) if "event_style=style" not in m.group(2)]
+    assert blind == [], f"parametrized over style but never use it: {blind}"
+
+
 # --------------------------------------------------------------- the 409 regression
 def test_reopened_slot_revives_tombstone_instead_of_409():
     """THE production bug. Slot open -> booked (we delete) -> customer cancels -> reopens.
@@ -212,7 +226,7 @@ def test_consecutive_failures_trip_the_breaker():
 @pytest.mark.parametrize("style", ["slots", "blocks"])
 def test_skips_all_deletes_when_fetch_failed(style):
     """The core safety property: a failed fetch must never delete existing events."""
-    cfg = mkconfig()
+    cfg = mkconfig(event_style=style)
     gone = _event()
     svc = FakeCalendarService(events=[_existing_from(gone, cfg)])
 
@@ -227,7 +241,7 @@ def test_skips_all_deletes_when_fetch_failed(style):
 def test_window_scoped_delete_protects_far_out_events(style):
     """A short near-term run must prune stale in-window events but NOT the deep run's
     far-out ones, so the hourly and 6-hourly sweeps can share one calendar."""
-    cfg = mkconfig(lookahead_days=21)
+    cfg = mkconfig(lookahead_days=21, event_style=style)
     near = _event(days_ahead=5)
     far = _event(stylist_id="24102", stylist="Sachi", days_ahead=40)
     svc = FakeCalendarService(events=[_existing_from(near, cfg), _existing_from(far, cfg)])
@@ -472,11 +486,102 @@ def test_a_changeover_losing_most_openings_is_still_refused():
 
 
 def test_opening_count_is_the_unit_that_survives_a_style_change():
-    ev = _event()
-    assert ev.opening_count == 1
+    # Several OPTIONS on one opening is still one opening — guards against
+    # opening_count accidentally being len(self.options).
+    multi = Event(stylist_id="1", stylist="N", stylist_role="", start=_event().start,
+                  options=[ServiceOption(n, "", 30, False) for n in ("a", "b", "c")])
+    assert multi.opening_count == 1
     block = build_entries([_event(days_ahead=3, hour=9), _event(days_ahead=3, hour=10)],
                           "blocks")[0]
     assert block.opening_count == 2
+    # The invariant that makes the changeover guard sound: openings are conserved across
+    # styles even though entry counts are not.
+    evs = [_event(days_ahead=3, hour=9 + h) for h in range(5)]
+    assert (sum(e.opening_count for e in build_entries(evs, "slots"))
+            == sum(e.opening_count for e in build_entries(evs, "blocks")) == 5)
+    assert len(build_entries(evs, "slots")) != len(build_entries(evs, "blocks"))
+
+
+def test_changeover_respects_per_stylist_authority():
+    """The purge is the ONE delete path that runs when `existing` is empty by construction,
+    so the withhold rule computed over `future_stale` cannot fire for it. A half-seen
+    stylist would otherwise be erased with no replacement written."""
+    cfg = mkconfig(event_style="blocks")
+    seen = [_event(stylist_id=f"s{i}", days_ahead=3, hour=9 + h)
+            for i in range(20) for h in range(6)]
+    sick = [_event(stylist_id="sick", days_ahead=4, hour=9 + h) for h in range(6)]
+    svc = FakeCalendarService(events=_legacy_calendar(seen + sick))
+
+    # 'sick' produced no openings this run and is not in staff_ok.
+    stats = sync_calendar.sync(cfg, _result(seen, staff_ok={f"s{i}" for i in range(20)}),
+                               service=svc)
+
+    assert stats["skipped_delete"] == 6          # sick's legacy entries withheld
+    assert stats["migrated"] == 120              # everyone else's retired
+    survivors = [e for e in svc.live() if not e.startswith("kidav")]
+    assert len(survivors) == 6                   # sick still visible to the public
+
+
+def test_changeover_purge_is_sized_on_writes_that_landed():
+    """Counting entries we merely INTENDED to write let a run that failed most of its
+    inserts still retire everything those inserts were meant to replace."""
+    cfg = mkconfig(event_style="blocks")
+    events = [_event(stylist_id=f"s{i}", days_ahead=3, hour=9 + h)
+              for i in range(40) for h in range(6)]
+    svc = FakeCalendarService(
+        events=_legacy_calendar(events),
+        # Every insert fails but not consecutively enough to trip the breaker.
+        fail_plan={("insert", None): [http_error(400, "Bad Request", "invalid")] * 24})
+
+    stats = sync_calendar.sync(cfg, _result(events), service=svc)
+
+    assert stats["failed_insert"] == 24
+    assert stats["migrated"] == 0                # nothing retired without a live replacement
+    assert stats["blocked_delete"] == 240
+
+
+def test_unstamped_legacy_entries_stay_deletable():
+    """An entry with no stylist stamp has UNKNOWN provenance, not 'not covered'. Treating
+    unknown as protected would mean nothing written before the stamp existed could ever be
+    pruned."""
+    cfg = mkconfig()
+    gone = _event(stylist_id="24102")
+    item = _existing_from(gone, cfg)
+    item.pop("extendedProperties")
+    svc = FakeCalendarService(events=[item])
+
+    stats = sync_calendar.sync(cfg, _result([], staff_ok={"175308"}), service=svc)
+    assert stats["delete"] == 1
+    assert stats["skipped_delete"] == 0
+
+
+def test_an_entry_that_just_started_is_not_deleted_while_still_in_the_feed():
+    """A slot that merely STARTED during the fetch is still in `desired`; deleting it would
+    churn an entry the same run then re-writes, and under blocks could retire a block whose
+    later openings are still bookable."""
+    cfg = mkconfig()
+    started = _event(days_ahead=0, hour=(datetime.now(NY).hour - 1) % 24)
+    if started.start > datetime.now(NY):          # guard the midnight wrap
+        started = _event(days_ahead=-1, hour=12)
+    svc = FakeCalendarService(events=[_existing_from(started, cfg)])
+
+    stats = sync_calendar.sync(cfg, _result([started]), service=svc)
+    assert stats["delete"] == 0
+    assert svc.methods("delete") == []
+
+
+def test_changeover_is_skipped_entirely_when_the_fetch_is_untrusted():
+    cfg = mkconfig(event_style="blocks")
+    events = _events(60)
+    svc = FakeCalendarService(events=_legacy_calendar(events))
+
+    stats = sync_calendar.sync(cfg, _result(events, ok=False), service=svc)
+
+    assert stats["migrated"] == 0
+    assert svc.methods("delete") == []
+    # sync() blocks deletes on an untrusted fetch; main() is what refuses to write at all.
+    # The property here is that every legacy entry survives.
+    assert len([e for e in svc.live() if not e.startswith("kidav")]) == 60
 
 
 def test_changeover_proceeds_when_replacements_actually_landed():

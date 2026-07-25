@@ -292,6 +292,11 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None) ->
             # all of them. Charging 1 biased `ok` toward True exactly when the outage
             # was broadest.
             fail_count += len(eligible)
+            # ...and they must lose delete authority too, or the two counters disagree:
+            # every one of these stylists also appears in some OTHER service, so without
+            # this they land in staff_ok, keep full delete authority, and have the events
+            # only this service could see deleted off the public calendar.
+            staff_failed.update(eligible)
             errors.append(f"{svc['name']}: funnel setup failed: {e}")
             continue
 

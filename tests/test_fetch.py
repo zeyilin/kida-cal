@@ -176,6 +176,22 @@ def test_funnel_setup_failure_charges_every_staff_it_skipped():
     assert any("funnel setup failed" in e for e in result.errors)
 
 
+def test_a_funnel_setup_failure_also_withdraws_delete_authority():
+    """The counters must agree. A stylist charged a failed lookup CANNOT keep delete
+    authority — and because every stylist appears in several services, both of svcA's
+    stylists still complete lookups elsewhere and would otherwise land in staff_ok while
+    simultaneously being counted as failed. The sync would then delete the events only
+    the failed service could see."""
+    FakeClient.fail_setup_for = {"svcA"}
+    result = _fetch()
+
+    assert result.lookups_failed == 2
+    assert NAO not in result.staff_ok
+    assert SACHI not in result.staff_ok
+    # ...even though both stylists did succeed on other services this run.
+    assert any(s.stylist_id == NAO for s in result.slots)
+
+
 # --------------------------------------------------------------- budget stop condition
 def test_budget_exhaustion_propagates_instead_of_becoming_a_lookup_failure():
     """BudgetExhausted means the REST of the run's data is missing. Laundering it into

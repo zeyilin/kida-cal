@@ -128,6 +128,18 @@ def _stylist_of(item: dict) -> str | None:
     return ((item.get("extendedProperties") or {}).get("private") or {}).get("stylist")
 
 
+def _openings_of(item: dict) -> int:
+    """How many openings an existing entry represents.
+
+    Legacy entries written before this stamp existed were always one-opening `slots`
+    entries, so 1 is the correct default rather than a guess."""
+    raw = ((item.get("extendedProperties") or {}).get("private") or {}).get("openings")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
 # ---------------------------------------------------------------- auth / service
 def get_service():
     from googleapiclient.discovery import build
@@ -237,9 +249,14 @@ def entry_body(entry, config: Config, notices: str | None) -> dict:
         "reminders": {"useDefault": False, "overrides": []},
         # Stamped so the delete pass can establish per-stylist authority: if a stylist's
         # lookups failed this run, we can recognise their entries and leave them alone
-        # instead of deleting on information we know is incomplete. Not compared in
-        # _needs_patch — it is derived from the id and never changes for a given event.
-        "extendedProperties": {"private": {"stylist": str(entry.stylist_id)}},
+        # instead of deleting on information we know is incomplete. `openings` lets a
+        # future changeover size what it is retiring in openings rather than entries,
+        # which is the only unit comparable across event_style. Neither is compared in
+        # _needs_patch — both are derived from the entry and stable for a given id.
+        "extendedProperties": {"private": {
+            "stylist": str(entry.stylist_id),
+            "openings": str(entry.opening_count),
+        }},
     }
 
 
@@ -454,29 +471,54 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     # Events that have already started can never be in `desired` (fetch drops past slots),
     # so they are unconditionally stale for reasons that say nothing about fetch health.
     # Keeping them out of the ratio stops routine pruning from tripping the guard.
-    past = [eid for eid in in_window if starts[eid] < now]
+    # `not in desired` applies to the past bucket too. A slot that merely STARTED while the
+    # fetch was running is still in `desired` (the fetch saw it minutes ago), and deleting
+    # it would remove an entry the same run is about to write — churn on every run, and
+    # under `blocks` it can retire a block whose later openings are still bookable.
+    past = [eid for eid in in_window if starts[eid] < now and eid not in desired]
     future_stale = [eid for eid in in_window
                     if eid not in desired and starts[eid] >= now]
     future_in_window = [eid for eid in in_window if starts[eid] >= now]
-    stale = past + future_stale
 
     # Delete authority is per stylist where we can establish it. An event we wrote carries
     # its stylist id, so if that person's lookups failed this run we simply leave their
     # entries alone rather than deleting on information we know is incomplete. Without this
     # a single flaky stylist (the busiest owns 9 of 60 lookups = 15%, inside the 20% slack
     # that still reports ok=True) would be wiped off the public calendar.
-    covered = result.staff_ok
-    if covered is not None:
-        withheld = [eid for eid in future_stale
-                    if (_stylist_of(existing[eid]) or "") not in covered
-                    and _stylist_of(existing[eid]) is not None]
-        if withheld:
-            print(f"::warning::withholding {len(withheld)} delete(s) for stylists whose "
+    staff_covered = result.staff_ok
+
+    def _may_delete(item: dict) -> bool:
+        """True unless the item belongs to a stylist we could not see completely.
+
+        An unstamped item (written by an older version) reports None, which means UNKNOWN
+        provenance, not "not covered" — it must stay deletable or nothing written before
+        the stamp existed could ever be pruned.
+        """
+        if staff_covered is None:
+            return True
+        who = _stylist_of(item)
+        return who is None or who in staff_covered
+
+    if staff_covered is not None:
+        held = {eid for eid in future_stale if not _may_delete(existing[eid])}
+        if held:
+            print(f"::warning::withholding {len(held)} delete(s) for stylists whose "
                   f"lookups failed this run; they keep their entries until we can see them")
-            stats["skipped_delete"] += len(withheld)
-            held = set(withheld)
+            stats["skipped_delete"] += len(held)
             future_stale = [e for e in future_stale if e not in held]
-            stale = past + future_stale
+        # The changeover purge needs the SAME authority. It is the one delete path that
+        # runs when `existing` is empty by construction, so the check above cannot fire
+        # for it — and a changeover is exactly when a half-seen stylist would otherwise be
+        # erased with no replacement written.
+        held_obs = [eid for eid in obsolete_in_window if not _may_delete(obsolete[eid])]
+        if held_obs:
+            print(f"::warning::withholding {len(held_obs)} changeover retirement(s) for "
+                  f"stylists whose lookups failed this run")
+            stats["skipped_delete"] += len(held_obs)
+            hold = set(held_obs)
+            obsolete_in_window = [e for e in obsolete_in_window if e not in hold]
+
+    stale = past + future_stale
 
     # ---- guards on the delete pass ----
     blocked = False
@@ -495,6 +537,7 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
         blocked = True
 
     failures: list[str] = []
+    failed_ids: set[str] = set()      # entries whose write did NOT land this run
     consecutive = 0
 
     def guard(exc, kind: str, eid: str) -> None:
@@ -511,6 +554,9 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
                 f"repeating this for every remaining event — check calendar sharing/scopes.")
         stats[f"failed_{kind}"] += 1
         failures.append(f"{kind} {eid}: {status} {sorted(_reasons(exc)) or ''}".strip())
+        if kind in ("insert", "patch"):
+            # This entry is not live, so it cannot justify retiring anything it replaces.
+            failed_ids.add(eid)
         consecutive += 1
         if consecutive >= MAX_CONSECUTIVE_FAILURES:
             raise WriteAborted(
@@ -592,26 +638,31 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     # entries are still standing. Doing this first — as the delete pass — meant an abort left
     # the public calendar emptied with nothing written back.
     if obsolete_in_window and not blocked:
+        # Size BOTH sides in openings, and count only the entries that actually LANDED.
+        #
+        # Entries are not comparable across styles (blocks are ~3.3x fewer for the same
+        # availability), so an entry-count comparison would refuse a healthy slots->blocks
+        # changeover and wave through a blocks->slots one that had lost most of its data.
+        # And counting entries we merely intended to write would let a run that failed 200
+        # of its inserts still retire everything those inserts were meant to replace.
+        live_now = sum(e.opening_count for e in entries
+                       if e.google_event_id() not in failed_ids)
+        retiring = sum(_openings_of(obsolete[eid]) for eid in obsolete_in_window)
         landed_entries = stats["insert"] + stats["revive"] + stats["patch"] + stats["unchanged"]
-        # Size the replacement set in OPENINGS, never in entries. The two styles encode the
-        # same availability at very different entry counts (~3.3x on real data), so counting
-        # entries would refuse a perfectly healthy slots->blocks changeover — and would wave
-        # through a blocks->slots one that had lost most of its data.
-        covered = sum(e.opening_count for e in entries)
-        if (not allow_mass_delete
-                and covered < DELETE_BLAST_RADIUS * len(obsolete_in_window)):
+        if not allow_mass_delete and live_now < DELETE_BLAST_RADIUS * retiring:
             # The replacement set is implausibly small next to what we are about to remove.
             # This is the shape of a partial fetch on a changeover run, which would
             # otherwise wipe the calendar and still exit 0.
             stats["blocked_delete"] += len(obsolete_in_window)
-            print(f"::error::refusing to retire {len(obsolete_in_window)} entries from the "
-                  f"previous event_style: the {landed_entries} replacement entries written "
-                  f"cover only {covered} openings. Fix the fetch first, or re-run with "
+            print(f"::error::refusing to retire {len(obsolete_in_window)} entries "
+                  f"({retiring} openings) from the previous event_style: the "
+                  f"{landed_entries} replacement entries that landed cover only "
+                  f"{live_now} openings. Fix the fetch first, or re-run with "
                   f"--allow-mass-delete.")
         else:
-            print(f"retiring {len(obsolete_in_window)} entries from the previous "
-                  f"event_style ({landed_entries} entries covering {covered} openings "
-                  f"are live)")
+            print(f"retiring {len(obsolete_in_window)} entries ({retiring} openings) from "
+                  f"the previous event_style ({landed_entries} entries covering "
+                  f"{live_now} openings are live)")
             for eid in obsolete_in_window:
                 do_delete(eid, "migrated")
 
@@ -644,8 +695,11 @@ def writes_attempted(stats: dict) -> int:
 
 
 # ---------------------------------------------------------------- fetch (de)serialization
-def result_to_json(result: FetchResult) -> str:
+def result_to_json(result: FetchResult, lookahead_days: int | None = None) -> str:
     return json.dumps({
+        # The window this capture covers. A replay must not be judged against a different
+        # one, or events outside the captured window read as "no longer offered".
+        "lookahead_days": lookahead_days,
         "ok": result.ok,
         "notices": result.notices,
         "lookups_ok": result.lookups_ok,
@@ -733,8 +787,19 @@ def main():
     print(f"depth: {'FULL' if deep else 'near'} ({days} days)")
 
     if args.from_json:
-        result = result_from_json(Path(args.from_json).read_text(encoding="utf-8"))
-        print(f"loaded {len(result.events)} events from {args.from_json}")
+        payload = Path(args.from_json).read_text(encoding="utf-8")
+        result = result_from_json(payload)
+        # The window the JSON was CAPTURED at governs, not the depth resolved at replay
+        # time. Replaying a 21-day capture under a 90-day depth would mark every event in
+        # days 22-90 stale — a mass delete driven purely by the replay flag.
+        captured = json.loads(payload).get("lookahead_days")
+        if captured and captured != config.lookahead_days:
+            print(f"::warning::{args.from_json} was captured over {captured} days but this "
+                  f"run resolved {config.lookahead_days}; using the captured window so the "
+                  f"replay cannot delete events it never looked for")
+            config.lookahead_days = int(captured)
+        print(f"loaded {len(result.events)} events from {args.from_json} "
+              f"({config.lookahead_days}-day window)")
     else:
         result = fetch(config)
 
@@ -754,7 +819,8 @@ def main():
     _github_output("deep", "true" if deep else "false")
 
     if args.fetch_json:
-        Path(args.fetch_json).write_text(result_to_json(result), encoding="utf-8")
+        Path(args.fetch_json).write_text(
+            result_to_json(result, config.lookahead_days), encoding="utf-8")
         print(f"wrote {args.fetch_json}")
 
     if args.ics:
@@ -809,8 +875,19 @@ def main():
 
     if service is not None and not args.dry_run:
         now = datetime.now(ZoneInfo(config.timezone))
-        last_deep = now if deep else marker_last_deep_sweep(read_marker(service, cal_id))
-        write_marker(service, cal_id, checked_at=now, entry_count=len(entries),
+        # Only a deep sweep that actually completed cleanly may claim one happened. A run
+        # that lost writes or had its delete pass refused did NOT refresh the far window,
+        # and stamping it would suppress the corrective sweep for deep_sweep_every_hours.
+        clean = write_failures(stats) == 0 and not stats["blocked_delete"]
+        last_deep = (now if (deep and clean)
+                     else marker_last_deep_sweep(read_marker(service, cal_id)))
+        if deep and not clean:
+            print("::warning::deep sweep did not complete cleanly; not recording it as one, "
+                  "so the next run will sweep deep again")
+        write_marker(service, cal_id, checked_at=now,
+                     # Report openings, not entries: under `blocks` an entry count would
+                     # understate availability ~3.3x to anyone reading the calendar.
+                     entry_count=sum(e.opening_count for e in entries),
                      last_deep=last_deep)
 
     failed = write_failures(stats)

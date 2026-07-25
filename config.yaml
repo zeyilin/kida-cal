@@ -29,7 +29,7 @@ timezone: America/New_York
 #
 # Do the changeover on a DEEP run (--depth full). A near-tier run would only convert the
 # next 21 days and leave 22-90 out as slots until the next deep sweep.
-event_style: slots
+event_style: blocks
 
 # Which stylists to include. Use "all" or a list of names (case-insensitive).
 # Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto (master barbers) · Hiroki (junior)

@@ -1,17 +1,41 @@
 """
 Sync open slots into a dedicated Google Calendar (the live path).
 
-Idempotent: each Event has a deterministic id (sha1 of stylist|start), so a slot maps
-to the same calendar event across runs. Each sync computes an insert/patch/delete diff
-against the calendar and applies the minimum changes:
+Idempotent: each calendar entry has a deterministic id derived from stylist + start, so an
+opening maps to the same calendar event across runs. Each sync computes a diff against the
+calendar and applies the minimum changes, in this order:
 
-  in feed, not on calendar   -> insert
-  in feed and on calendar    -> patch if content changed
-  on calendar, not in feed   -> delete (it got booked)
+  on calendar, not in feed    -> delete   (it got booked)
+  in feed and on calendar     -> patch if content changed
+  in feed, not on calendar    -> insert
+  wrong id scheme for the configured event_style -> delete (one-time changeover)
 
-Safety: we only ever touch our own secondary calendar, never the primary. If the fetch
-did not clearly succeed (FetchResult.ok is False, e.g. every lookup 429'd), we SKIP all
-deletes so a transient outage can't wipe the calendar.
+Deletes run FIRST and deliberately so. They are the correctness-critical half: an event we
+fail to delete is a publicly advertised appointment that is already booked. Inserts merely
+delay good news. `stale` and `desired` are disjoint by construction, so the ordering is safe.
+
+Why insert has a 409 fallback
+-----------------------------
+Google's events.delete is a *soft* delete: the event becomes status="cancelled" and its id
+stays reserved for ~30 days. We list with showDeleted=False, so those tombstones are
+invisible to us. The ordinary salon lifecycle — slot open, booked (we delete), customer
+cancels, slot reopens — therefore produces an id that is absent from `existing` but still
+reserved by Google, and a plain insert fails with 409 "The requested identifier already
+exists.". events.update is a PUT and our bodies carry no "status", so it defaults back to
+"confirmed" and revives the tombstone. This is Google's own documented remedy for 409.
+The same fallback covers a retry whose original insert succeeded but whose response was lost.
+
+Safety
+------
+* We only ever touch our own secondary calendar, never the primary.
+* If the fetch did not clearly succeed (FetchResult.ok is False) we SKIP every delete, and
+  main() refuses to write at all, so a transient Timely outage cannot wipe the calendar.
+* Even on a clean fetch, a delete pass that would remove more than half of the in-window
+  events is refused unless --allow-mass-delete is passed. The denominator is IN-WINDOW, not
+  whole-calendar: a 21-day run sees only ~350 of ~3300 events, so a whole-calendar
+  denominator would wave through a near-total wipe.
+* Individual write failures are isolated and counted; one bad event no longer aborts the run.
+  Auth/permission failures still abort immediately rather than retrying thousands of times.
 
 Auth: two supported methods, selected automatically —
   1. Service account (preferred for unattended CI): set KIDA_SERVICE_ACCOUNT_JSON to the
@@ -26,15 +50,17 @@ Never commit the SA key or token.
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import time
 from datetime import datetime, timedelta
+from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .fetch_availability import Config, FetchResult, fetch
-from .ics_export import event_description
-from .models import Event
+from .ics_export import entry_description
+from .models import (BLOCK_PREFIX, ID_PREFIX, MARKER_ID, build_entries, event_from_dict,
+                     event_to_dict)
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 LOCATION = "KIDA NYC, 369 Broome Street, New York, NY 10013"
@@ -42,32 +68,64 @@ TOKEN_PATH = Path(os.path.expanduser("~/.config/kida-cal/token.json"))
 CLIENT_SECRET_ENV = "KIDA_GOOGLE_CLIENT_SECRET"       # path to client_secret.json (OAuth)
 SERVICE_ACCOUNT_ENV = "KIDA_SERVICE_ACCOUNT_JSON"     # path to service-account key (preferred)
 
+API_RETRIES = 5              # handled inside googleapiclient: jittered backoff on 429/5xx
+MAX_CONSECUTIVE_FAILURES = 25   # circuit breaker: stop grinding through a systemic failure
+DELETE_BLAST_RADIUS = 0.5       # refuse a delete pass larger than this share of the window
+DELETE_BLAST_MIN = 50           # ...but only once the window is big enough to judge
+FAILURE_EXIT_FLOOR = 5          # below this many write failures, still exit 0
+FAILURE_EXIT_SHARE = 0.05
+
+
+class WriteAborted(RuntimeError):
+    """Raised when the sync stops early (auth failure or too many consecutive errors)."""
+
 
 def using_service_account() -> bool:
     return bool(os.environ.get(SERVICE_ACCOUNT_ENV))
 
 
-def _execute(request, *, tries=6):
-    """Run a Google API request, backing off on rate-limit / transient errors.
+# ---------------------------------------------------------------- HTTP helpers
+def _execute(request):
+    """Run a Google API request.
 
-    A large first sync (rewriting all events + inserting the 90-day backlog) can burst
-    past Google's per-100-seconds write limit; this retries instead of failing the run.
+    googleapiclient already implements jittered exponential backoff for 429, 5xx and
+    403-rate-limit responses when given num_retries, so we do not hand-roll it. This
+    wrapper exists only so the call site is uniform and the fake in tests has one seam.
     """
-    from googleapiclient.errors import HttpError
-    backoff = 1.5
-    for attempt in range(tries):
-        try:
-            return request.execute()
-        except HttpError as e:
-            status = getattr(getattr(e, "resp", None), "status", None)
-            reason = str(e).lower()
-            transient = status in (429, 500, 502, 503) or (
-                status == 403 and ("rate" in reason or "quota" in reason))
-            if transient and attempt < tries - 1:
-                time.sleep(backoff)
-                backoff *= 2
-                continue
-            raise
+    return request.execute(num_retries=API_RETRIES)
+
+
+def _status(exc) -> int | None:
+    return getattr(getattr(exc, "resp", None), "status", None)
+
+
+def _reasons(exc) -> set[str]:
+    """Structured error reasons. Never substring-match str(exc): it contains the request
+    URI, so a calendar id containing 'rate' would classify every error as rate limiting."""
+    try:
+        return {d.get("reason", "") for d in (exc.error_details or []) if isinstance(d, dict)}
+    except Exception:
+        return set()
+
+
+# Short-term throttling: survivable, keep going (the consecutive-failure breaker still
+# stops us if it persists).
+_RATE_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
+# A exhausted daily/project quota: retrying every remaining event cannot succeed, so abort
+# with a message that says so instead of blaming calendar sharing.
+_QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded"}
+
+
+def _is_rate_limited(exc) -> bool:
+    return bool(_reasons(exc) & _RATE_REASONS)
+
+
+def _stylist_of(item: dict) -> str | None:
+    """The stylist id we stamped on an event when we wrote it, if present.
+
+    Entries written by older versions have no such stamp and return None, which callers
+    must treat as "unknown", never as "not covered"."""
+    return ((item.get("extendedProperties") or {}).get("private") or {}).get("stylist")
 
 
 # ---------------------------------------------------------------- auth / service
@@ -101,7 +159,7 @@ def get_service():
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-def ensure_calendar(service, config: Config) -> str:
+def ensure_calendar(service, config: Config, dry_run: bool = False) -> str:
     """Return the target calendar id.
 
     Resolution order: KIDA_CALENDAR_ID env → config.calendar_id → (OAuth only) find-or-create
@@ -116,6 +174,10 @@ def ensure_calendar(service, config: Config) -> str:
             "Service-account auth requires an explicit calendar id. Create a calendar, share "
             "it with the service account's email ('Make changes to events'), and set "
             "KIDA_CALENDAR_ID (or config.calendar_id).")
+    if dry_run:
+        raise SystemExit(
+            "No calendar id configured. Refusing to create one during --dry-run — set "
+            "KIDA_CALENDAR_ID or config.calendar_id.")
     # OAuth only: look for an existing calendar with our name before creating a duplicate.
     page_token = None
     while True:
@@ -135,105 +197,491 @@ def ensure_calendar(service, config: Config) -> str:
     return created["id"]
 
 
+def preflight(service, cal_id: str) -> None:
+    """Prove we can reach the calendar BEFORE spending ~85 minutes fetching from Timely.
+
+    Merely building the service proves nothing — for a service account it does no network
+    I/O at all, which is why 59 failed runs each burned a full paced Timely sweep before
+    discovering they could not write.
+    """
+    from googleapiclient.errors import HttpError
+    try:
+        _execute(service.calendars().get(calendarId=cal_id))
+    except HttpError as e:
+        raise SystemExit(
+            f"cannot access calendar {cal_id!r} ({_status(e)}): {e}. Check that the calendar "
+            f"is shared with the service account with 'Make changes to events'.")
+
+
 # ---------------------------------------------------------------- event bodies
-def event_body(ev: Event, config: Config, notices: str) -> dict:
+def entry_body(entry, config: Config, notices: str | None) -> dict:
+    """Build the Calendar API body for one entry.
+
+    Deliberately absent:
+      * colorId — it overrides whatever colour a subscriber chose for the calendar, and they
+        can never change it back. The palette it indexes is the 11-entry EVENT palette, not
+        the calendar palette the config key name implied.
+      * source — visible only to the event's *creator*, i.e. the service account. It reached
+        zero human readers while costing bytes on every single write.
+    """
     return {
-        "id": ev.google_event_id(),
-        "summary": ev.summary(),
+        "id": entry.google_event_id(),
+        "summary": entry.summary(),
         "location": LOCATION,
-        "description": event_description(ev, notices),
-        "start": {"dateTime": ev.start.isoformat(), "timeZone": config.timezone},
-        "end": {"dateTime": ev.end.isoformat(), "timeZone": config.timezone},
+        "description": entry_description(entry, notices),
+        "start": {"dateTime": entry.start.isoformat(), "timeZone": config.timezone},
+        "end": {"dateTime": entry.end.isoformat(), "timeZone": config.timezone},
         "transparency": "transparent",          # shows as Free
-        "reminders": {"useDefault": False, "overrides": []},  # no notifications
-        "colorId": str(config.calendar_color_id),
-        "source": {"title": "Book on KIDA NYC", "url": ev.book_url},
+        # Suppresses notifications for the service account only. Subscribers keep whatever
+        # default their own calendar applies to this calendar.
+        "reminders": {"useDefault": False, "overrides": []},
+        # Stamped so the delete pass can establish per-stylist authority: if a stylist's
+        # lookups failed this run, we can recognise their entries and leave them alone
+        # instead of deleting on information we know is incomplete. Not compared in
+        # _needs_patch — it is derived from the id and never changes for a given event.
+        "extendedProperties": {"private": {"stylist": str(entry.stylist_id)}},
     }
 
 
-def _needs_patch(existing: dict, desired: dict) -> bool:
-    for k in ("summary", "description", "location", "transparency", "colorId"):
+# Fields compared to decide whether an existing event needs rewriting. Keep this list
+# minimal: any field Google normalizes on write (timeZone, source, …) will fail to
+# round-trip and cause a full-calendar patch storm on every single run.
+_PATCH_FIELDS = ("summary", "description", "location", "transparency")
+
+
+def _needs_patch(existing: dict, desired: dict, compare_description: bool = True) -> bool:
+    for k in _PATCH_FIELDS:
+        if k == "description" and not compare_description:
+            continue
         if existing.get(k) != desired.get(k):
             return True
     for k in ("start", "end"):
-        if (existing.get(k, {}).get("dateTime") != desired[k]["dateTime"]):
+        if existing.get(k, {}).get("dateTime") != desired[k]["dateTime"]:
             return True
     return False
 
 
-# ---------------------------------------------------------------- diff + apply
-def sync(config: Config, result: FetchResult, service=None, dry_run=False) -> dict:
-    desired = {ev.google_event_id(): event_body(ev, config, result.notices)
-               for ev in result.events}
+def _scheme(event_id: str) -> str:
+    """Which id scheme an existing calendar event belongs to."""
+    return "blocks" if event_id.startswith(BLOCK_PREFIX) else "slots"
 
-    stats = {"insert": 0, "patch": 0, "delete": 0, "unchanged": 0, "skipped_delete": 0}
 
-    if dry_run and service is None:
-        # No API access: just report what we'd publish.
-        stats["insert"] = len(desired)
-        print(f"[dry-run] would publish {len(desired)} events "
-              f"(no calendar access to diff against)")
-        for ev in list(result.events)[:10]:
-            print(f"  INSERT {ev.start:%a %m-%d %H:%M} {ev.summary()}")
-        if len(result.events) > 10:
-            print(f"  ... and {len(result.events) - 10} more")
-        return stats
+def _parse_start(item: dict, tz) -> datetime | None:
+    """Start instant of an existing calendar event, or None if unparseable.
 
-    cal_id = ensure_calendar(service, config)
+    Guards TypeError as well as ValueError: comparing a naive datetime against an aware
+    horizon raises TypeError, which would otherwise kill the whole delete phase.
+    """
+    s = item.get("start") or {}
+    raw = s.get("dateTime") or s.get("date")
+    if not raw:
+        return None
+    try:
+        d = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if d.tzinfo is None:          # all-day ("date") or an unexpected naive value
+        d = d.replace(tzinfo=tz)  # assume salon-local
+    return d
 
-    # Load our existing events (only ones we created carry the 'kida' id prefix).
-    existing: dict[str, dict] = {}
+
+def _list_all(service, cal_id: str):
+    """Every event on the calendar. Deliberately unbounded in time: this listing is how
+    past events get pruned, so adding timeMin would let dead history accumulate forever."""
     page_token = None
     while True:
         resp = _execute(service.events().list(
             calendarId=cal_id, showDeleted=False, singleEvents=True,
             maxResults=2500, pageToken=page_token))
         for item in resp.get("items", []):
-            if item["id"].startswith("kida"):
-                existing[item["id"]] = item
+            yield item
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
 
-    # inserts / patches
-    for eid, body in desired.items():
-        if eid not in existing:
-            stats["insert"] += 1
-            if not dry_run:
-                _execute(service.events().insert(calendarId=cal_id, body=body))
-        elif _needs_patch(existing[eid], body):
-            stats["patch"] += 1
-            if not dry_run:
-                _execute(service.events().patch(calendarId=cal_id, eventId=eid, body=body))
-        else:
-            stats["unchanged"] += 1
 
-    # deletes — window-scoped so a short near-term run can't wipe the deep run's
-    # far-out events. Only prune events whose start is within THIS run's lookahead
-    # window (this also cleans past events); leave far-future and unparseable ones.
-    tz = ZoneInfo(config.timezone)
-    horizon = datetime.now(tz) + timedelta(days=config.lookahead_days)
-
-    def _start(item):
-        s = item.get("start", {}).get("dateTime")
-        try:
-            return datetime.fromisoformat(s) if s else None
-        except ValueError:
+# ---------------------------------------------------------------- status marker
+def read_marker(service, cal_id: str) -> dict | None:
+    from googleapiclient.errors import HttpError
+    try:
+        return _execute(service.events().get(calendarId=cal_id, eventId=MARKER_ID))
+    except HttpError as e:
+        if _status(e) in (404, 410):
             return None
+        raise
 
-    stale = [eid for eid, item in existing.items()
-             if eid not in desired and (_start(item) is not None and _start(item) <= horizon)]
+
+def marker_last_deep_sweep(marker: dict | None) -> datetime | None:
+    if not marker:
+        return None
+    raw = ((marker.get("extendedProperties") or {}).get("private") or {}).get("last_deep_sweep")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def write_marker(service, cal_id: str, *, checked_at: datetime, entry_count: int,
+                 last_deep: datetime | None, dry_run: bool = False) -> None:
+    """Publish an all-day 'last checked' event.
+
+    Without this the calendar looks equally healthy whether it was synced 5 minutes or 5 days
+    ago — which is exactly how a 3-day outage went unnoticed. One patch per run; never stamp
+    a timestamp into per-event descriptions, which would rewrite the whole calendar hourly.
+    """
+    from googleapiclient.errors import HttpError
+
+    day = checked_at.date()
+    age_note = ""
+    if last_deep:
+        hours = (checked_at - last_deep).total_seconds() / 3600
+        age_note = f"Last full 90-day sweep: {hours:.0f}h ago.\n"
+    body = {
+        "id": MARKER_ID,
+        "summary": f"✓ KIDA slots checked {checked_at:%-I:%M %p} · {entry_count} open",
+        "description": (
+            f"This calendar was last refreshed at {checked_at:%Y-%m-%d %-I:%M %p %Z}.\n"
+            f"{age_note}"
+            "If this date is not today, the sync is broken and the openings shown below "
+            "are stale — confirm everything on KIDA's site."),
+        "start": {"date": day.isoformat()},
+        "end": {"date": (day + timedelta(days=1)).isoformat()},
+        "transparency": "transparent",
+        "reminders": {"useDefault": False, "overrides": []},
+        # Only record a deep-sweep time we actually know. Coercing None to `checked_at`
+        # meant a `--depth near` dispatch against a marker-less calendar would claim a full
+        # sweep had just happened, suppressing the real one for deep_sweep_every_hours.
+        # An absent key keeps meaning "unknown", which resolve_depth already reads as
+        # "go deep". last_run separately records that the run happened at all.
+        "extendedProperties": {"private": dict(
+            {"last_run": checked_at.isoformat()},
+            **({"last_deep_sweep": last_deep.isoformat()} if last_deep else {}))},
+    }
+    if dry_run:
+        return
+    try:
+        _execute(service.events().insert(calendarId=cal_id, body=body))
+    except HttpError as e:
+        if _status(e) != 409:
+            raise
+        _execute(service.events().update(calendarId=cal_id, eventId=MARKER_ID, body=body))
+
+
+def resolve_depth(service, cal_id: str, config: Config, requested: str) -> tuple[int, bool]:
+    """Return (lookahead_days, is_deep_sweep).
+
+    'auto' decides from *elapsed time since the last deep sweep*, read off the marker event,
+    rather than from the wall clock. The old `date -u +%H % 6` scheme assumed the cron fires:
+    over one measured 180-hour window GitHub delivered 56% of hourly ticks, 00 UTC never fired
+    once, and deep sweeps landed 14 times against 30 intended. An elapsed-time check is immune
+    to dropped ticks, cron drift, and a long run pushing the next one past its hour.
+    """
+    if requested == "near":
+        return config.near_lookahead_days, False
+    if requested == "full":
+        return config.lookahead_days, True
+
+    last_deep = marker_last_deep_sweep(read_marker(service, cal_id)) if service else None
+    if last_deep is None:
+        return config.lookahead_days, True
+    now = datetime.now(last_deep.tzinfo or ZoneInfo(config.timezone))
+    if now - last_deep >= timedelta(hours=config.deep_sweep_every_hours):
+        return config.lookahead_days, True
+    return config.near_lookahead_days, False
+
+
+# ---------------------------------------------------------------- diff + apply
+def sync(config: Config, result: FetchResult, service=None, dry_run=False,
+         allow_mass_delete=False) -> dict:
+    from googleapiclient.errors import HttpError
+
+    tz = ZoneInfo(config.timezone)
+    entries = build_entries(result.events, config.event_style)
+
+    # A failed notices scrape returns None (distinct from "" for a genuinely empty banner).
+    # The banner text is an input to every description, so treating a 20-second kidanyc.com
+    # blip as "banner cleared" would rewrite all ~3300 events, then rewrite them back next run.
+    compare_description = result.notices is not None
+    desired = {e.google_event_id(): entry_body(e, config, result.notices) for e in entries}
+
+    stats = {"insert": 0, "revive": 0, "patch": 0, "delete": 0, "migrated": 0,
+             "unchanged": 0, "skipped_delete": 0, "blocked_delete": 0,
+             "failed_insert": 0, "failed_patch": 0, "failed_delete": 0}
+
+    if dry_run and service is None:
+        # No API access: just report what we'd publish.
+        stats["insert"] = len(desired)
+        print(f"[dry-run] would publish {len(desired)} entries "
+              f"(no calendar access to diff against)")
+        for e in entries[:10]:
+            print(f"  INSERT {e.start:%a %m-%d %H:%M} {e.summary()}")
+        if len(entries) > 10:
+            print(f"  ... and {len(entries) - 10} more")
+        return stats
+
+    cal_id = ensure_calendar(service, config, dry_run=dry_run)
+
+    # Load our existing events. Only ids carrying our prefix are ours; the marker is state,
+    # not a slot; and entries written under the *other* event_style are obsolete by
+    # construction (an event_style changeover) and are handled by a separate, later pass.
+    existing: dict[str, dict] = {}
+    obsolete: dict[str, dict] = {}
+    for item in _list_all(service, cal_id):
+        eid = item.get("id", "")
+        if not eid.startswith(ID_PREFIX) or eid == MARKER_ID:
+            continue
+        (existing if _scheme(eid) == config.event_style else obsolete)[eid] = item
+
+    # The horizon is the END of the last day the fetch covered. fetch() filters by DATE
+    # (day_date > horizon), so a datetime horizon would leave later-in-the-day slots on the
+    # final day permanently undeletable: absent from `desired`, but past the cutoff.
+    last_day = (datetime.now(tz) + timedelta(days=config.lookahead_days)).date()
+    horizon = datetime.combine(last_day + timedelta(days=1), dtime.min, tzinfo=tz)
+    now = datetime.now(tz)
+
+    starts = {eid: _parse_start(item, tz) for eid, item in existing.items()}
+    obs_starts = {eid: _parse_start(item, tz) for eid, item in obsolete.items()}
+
+    # Deletes are window-scoped so a short near-term run can't wipe the deep run's far-out
+    # events. That applies to the obsolete bucket too: a near-tier run that meets a style
+    # changeover must not purge 90 days of entries it can only replace 21 days of.
+    in_window = [eid for eid, d in starts.items() if d is not None and d <= horizon]
+    obsolete_in_window = [eid for eid, d in obs_starts.items()
+                          if d is not None and d <= horizon]
+
+    # Events that have already started can never be in `desired` (fetch drops past slots),
+    # so they are unconditionally stale for reasons that say nothing about fetch health.
+    # Keeping them out of the ratio stops routine pruning from tripping the guard.
+    past = [eid for eid in in_window if starts[eid] < now]
+    future_stale = [eid for eid in in_window
+                    if eid not in desired and starts[eid] >= now]
+    future_in_window = [eid for eid in in_window if starts[eid] >= now]
+    stale = past + future_stale
+
+    # Delete authority is per stylist where we can establish it. An event we wrote carries
+    # its stylist id, so if that person's lookups failed this run we simply leave their
+    # entries alone rather than deleting on information we know is incomplete. Without this
+    # a single flaky stylist (the busiest owns 9 of 60 lookups = 15%, inside the 20% slack
+    # that still reports ok=True) would be wiped off the public calendar.
+    covered = result.staff_ok
+    if covered is not None:
+        withheld = [eid for eid in future_stale
+                    if (_stylist_of(existing[eid]) or "") not in covered
+                    and _stylist_of(existing[eid]) is not None]
+        if withheld:
+            print(f"::warning::withholding {len(withheld)} delete(s) for stylists whose "
+                  f"lookups failed this run; they keep their entries until we can see them")
+            stats["skipped_delete"] += len(withheld)
+            held = set(withheld)
+            future_stale = [e for e in future_stale if e not in held]
+            stale = past + future_stale
+
+    # ---- guards on the delete pass ----
+    blocked = False
     if not result.ok:
-        stats["skipped_delete"] = len(stale)
+        stats["skipped_delete"] += len(stale) + len(obsolete_in_window)
         print(f"WARNING: fetch not ok (ok={result.lookups_ok} failed={result.lookups_failed}); "
-              f"skipping {len(stale)} deletes to avoid wiping the calendar")
-    else:
-        for eid in stale:
-            stats["delete"] += 1
-            if not dry_run:
-                _execute(service.events().delete(calendarId=cal_id, eventId=eid))
+              f"skipping {len(stale) + len(obsolete_in_window)} deletes to avoid wiping "
+              f"the calendar")
+        blocked = True
+    elif (not allow_mass_delete and len(future_in_window) >= DELETE_BLAST_MIN
+            and len(future_stale) > DELETE_BLAST_RADIUS * len(future_in_window)):
+        stats["blocked_delete"] = len(future_stale)
+        print(f"::error::refusing to delete {len(future_stale)} of {len(future_in_window)} "
+              f"upcoming in-window events (> {DELETE_BLAST_RADIUS:.0%}). Fetch reported ok "
+              f"but looks partial. Re-run with --allow-mass-delete if this really is correct.")
+        blocked = True
 
+    failures: list[str] = []
+    consecutive = 0
+
+    def guard(exc, kind: str, eid: str) -> None:
+        """Record a per-item write failure, or abort if it is not survivable."""
+        nonlocal consecutive
+        status = _status(exc)
+        if status == 403 and _reasons(exc) & _QUOTA_REASONS:
+            raise WriteAborted(
+                f"{kind} {eid}: Google Calendar quota exhausted ({sorted(_reasons(exc))}). "
+                f"Aborting; the quota resets on Google's schedule and the next run retries.")
+        if status in (401, 403) and not _is_rate_limited(exc):
+            raise WriteAborted(
+                f"{kind} {eid}: {status} {sorted(_reasons(exc)) or exc}. Aborting rather than "
+                f"repeating this for every remaining event — check calendar sharing/scopes.")
+        stats[f"failed_{kind}"] += 1
+        failures.append(f"{kind} {eid}: {status} {sorted(_reasons(exc)) or ''}".strip())
+        consecutive += 1
+        if consecutive >= MAX_CONSECUTIVE_FAILURES:
+            raise WriteAborted(
+                f"{consecutive} consecutive write failures; aborting. Last: {failures[-1]}")
+
+    def do_delete(eid: str, stat_key: str) -> None:
+        nonlocal consecutive
+        if dry_run:
+            stats[stat_key] += 1
+            return
+        try:
+            _execute(service.events().delete(calendarId=cal_id, eventId=eid))
+        except HttpError as e:
+            # Already gone is the state we wanted. googleapiclient's own retry can turn a
+            # successful delete into a 404/410 on the retried call, so this is routine.
+            if _status(e) in (404, 410):
+                stats[stat_key] += 1
+                consecutive = 0
+                return
+            guard(e, "delete", eid)
+            return
+        stats[stat_key] += 1
+        consecutive = 0
+
+    # ---- 1. deletes, first: a stale event is a publicly advertised booked appointment ----
+    if not blocked:
+        for eid in stale:
+            do_delete(eid, "delete")
+
+    # ---- 2. patches ----
+    for eid, body in desired.items():
+        item = existing.get(eid)
+        if item is None:
+            continue
+        if not _needs_patch(item, body, compare_description):
+            stats["unchanged"] += 1
+            continue
+        if dry_run:
+            stats["patch"] += 1
+            continue
+        try:
+            _execute(service.events().patch(calendarId=cal_id, eventId=eid, body=body))
+        except HttpError as e:
+            guard(e, "patch", eid)
+            continue
+        stats["patch"] += 1
+        consecutive = 0
+
+    # ---- 3. inserts, with the 409 tombstone fallback ----
+    for eid, body in desired.items():
+        if eid in existing:
+            continue
+        if dry_run:
+            stats["insert"] += 1
+            continue
+        try:
+            _execute(service.events().insert(calendarId=cal_id, body=body))
+        except HttpError as e:
+            if _status(e) != 409:
+                guard(e, "insert", eid)
+                continue
+            # The id is reserved by a tombstone (or by our own retried insert). update() is
+            # a PUT and the body carries no "status", so it revives the event as confirmed.
+            try:
+                _execute(service.events().update(calendarId=cal_id, eventId=eid, body=body))
+            except HttpError as e2:
+                guard(e2, "insert", eid)
+                continue
+            stats["revive"] += 1
+            consecutive = 0
+            continue
+        stats["insert"] += 1
+        consecutive = 0
+
+    # ---- 4. the event_style changeover purge, LAST and separately guarded ----
+    # These are entries written under the other style. They run after the inserts, not with
+    # the deletes, so a changeover can only ever remove an entry once its replacement is
+    # already live: if the write pass aborts partway (quota, auth, a failure streak) the old
+    # entries are still standing. Doing this first — as the delete pass — meant an abort left
+    # the public calendar emptied with nothing written back.
+    if obsolete_in_window and not blocked:
+        landed = stats["insert"] + stats["revive"] + stats["patch"] + stats["unchanged"]
+        if (not allow_mass_delete
+                and landed < DELETE_BLAST_RADIUS * len(obsolete_in_window)):
+            # The replacement set is implausibly small next to what we are about to remove.
+            # This is the shape of a partial fetch on a changeover run, which would
+            # otherwise wipe the calendar and still exit 0.
+            stats["blocked_delete"] += len(obsolete_in_window)
+            print(f"::error::refusing to retire {len(obsolete_in_window)} entries from the "
+                  f"previous event_style: only {landed} replacement entries were written. "
+                  f"Fix the fetch first, or re-run with --allow-mass-delete.")
+        else:
+            print(f"retiring {len(obsolete_in_window)} entries from the previous "
+                  f"event_style ({landed} replacements are live)")
+            for eid in obsolete_in_window:
+                do_delete(eid, "migrated")
+
+    if failures:
+        print(f"::warning::{len(failures)} write(s) failed; first 20:")
+        for f in failures[:20]:
+            print(f"  {f}")
+
+    # Patch-churn alarm. _PATCH_FIELDS is deliberately minimal because any field Google
+    # normalizes on write will fail to compare equal on the next run and rewrite the entire
+    # calendar, forever, at ~1 write per event per hour. Tests can only prove our body
+    # round-trips against ITSELF; whether it round-trips against Google's normalization is
+    # only observable in production, so watch for the signature here.
+    settled = stats["patch"] + stats["unchanged"]
+    if settled >= 50 and stats["patch"] > 0.2 * settled:
+        print(f"::warning::{stats['patch']} of {settled} existing events needed a patch "
+              f"({stats['patch'] / settled:.0%}). Above ~20% this usually means a field in "
+              f"_PATCH_FIELDS does not round-trip from Google and every run is rewriting "
+              f"the whole calendar. Diff one event's stored body against entry_body().")
     return stats
+
+
+def write_failures(stats: dict) -> int:
+    return stats["failed_insert"] + stats["failed_patch"] + stats["failed_delete"]
+
+
+def writes_attempted(stats: dict) -> int:
+    return (stats["insert"] + stats["revive"] + stats["patch"] + stats["delete"]
+            + stats["migrated"] + write_failures(stats))
+
+
+# ---------------------------------------------------------------- fetch (de)serialization
+def result_to_json(result: FetchResult) -> str:
+    return json.dumps({
+        "ok": result.ok,
+        "notices": result.notices,
+        "lookups_ok": result.lookups_ok,
+        "lookups_failed": result.lookups_failed,
+        "errors": result.errors,
+        "staff_ok": sorted(result.staff_ok) if result.staff_ok is not None else None,
+        "events": [event_to_dict(e) for e in result.events],
+    }, indent=1)
+
+
+def result_from_json(text: str) -> FetchResult:
+    d = json.loads(text)
+    return FetchResult(
+        slots=[], events=[event_from_dict(e) for e in d.get("events", [])],
+        notices=d.get("notices"), ok=bool(d.get("ok")),
+        lookups_ok=d.get("lookups_ok", 0), lookups_failed=d.get("lookups_failed", 0),
+        errors=d.get("errors", []),
+        staff_ok=set(d["staff_ok"]) if d.get("staff_ok") is not None else None)
+
+
+def _github_output(key: str, value: str) -> None:
+    """Expose a value to later workflow steps (no-op outside Actions)."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{key}={value}\n")
+    except OSError:
+        pass
+
+
+def _summary_line(text: str) -> None:
+    """Mirror a line into the Actions run summary, so the run list stops being 100
+    indistinguishable rows."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- CLI
@@ -242,19 +690,19 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="print the insert/patch/delete diff without writing")
     ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--depth", choices=("auto", "near", "full"), default="auto",
+                    help="auto (default) goes deep only when the last deep sweep is stale")
     ap.add_argument("--ics", default=None, help="also write an .ics file to this path")
+    ap.add_argument("--fetch-json", default=None,
+                    help="write the fetch result to this path (for artifacting/replay)")
+    ap.add_argument("--from-json", default=None,
+                    help="skip the Timely fetch and load a previous result from this path")
+    ap.add_argument("--allow-mass-delete", action="store_true",
+                    help="bypass the delete blast-radius guard (manual recovery only)")
     args = ap.parse_args()
 
     config = Config.load(args.config)
-    result = fetch(config)
-    print(f"fetched: ok={result.ok} lookups ok={result.lookups_ok} "
-          f"failed={result.lookups_failed} → {len(result.events)} events")
-
-    if args.ics:
-        from . import ics_export
-        ics_export.write(args.ics, result.events, result.notices,
-                         datetime.now(ZoneInfo(config.timezone)))
-        print(f"wrote {args.ics}")
+    print(f"config: {config.describe()}")
 
     service = None
     if (not args.dry_run or using_service_account()
@@ -267,13 +715,103 @@ def main():
             else:
                 raise
 
-    stats = sync(config, result, service=service, dry_run=args.dry_run)
-    print(("[dry-run] " if args.dry_run else "") + "sync: " +
-          " ".join(f"{k}={v}" for k, v in stats.items()))
+    cal_id = None
+    if service is not None:
+        cal_id = ensure_calendar(service, config, dry_run=args.dry_run)
+        preflight(service, cal_id)      # fail in 1 second, not after an 85-minute fetch
 
-    # Fail loudly for CI if auth/shape broke and we got nothing while not in dry-run.
-    if not args.dry_run and not result.ok:
+    # Depth first: it decides how far the fetch reaches.
+    days, deep = resolve_depth(service, cal_id, config, args.depth)
+    config.lookahead_days = days
+    print(f"depth: {'FULL' if deep else 'near'} ({days} days)")
+
+    if args.from_json:
+        result = result_from_json(Path(args.from_json).read_text(encoding="utf-8"))
+        print(f"loaded {len(result.events)} events from {args.from_json}")
+    else:
+        result = fetch(config)
+
+    print(f"fetched: ok={result.ok} lookups ok={result.lookups_ok} "
+          f"failed={result.lookups_failed} → {len(result.events)} events "
+          f"({result.requests_made} requests)")
+    if result.errors:
+        from collections import Counter
+        # These were collected and then never printed on the production path, so every
+        # Timely 429 was invisible.
+        for kind, n in Counter(e.split(":")[0] for e in result.errors).most_common(10):
+            print(f"  fetch error x{n}: {kind}")
+        for e in result.errors[:20]:
+            print(f"    {e}")
+
+    entries = build_entries(result.events, config.event_style)
+    _github_output("deep", "true" if deep else "false")
+
+    if args.fetch_json:
+        Path(args.fetch_json).write_text(result_to_json(result), encoding="utf-8")
+        print(f"wrote {args.fetch_json}")
+
+    if args.ics:
+        # Only a deep sweep may republish the feed. A near-term run only knows about the
+        # next ~3 weeks, so writing the .ics from it would truncate the published feed's
+        # horizon to 21 days — and since Google re-fetches an .ics only every 8-24h,
+        # subscribers would almost always be served the short version. Skipping the write
+        # leaves the previous, complete deployment live; the workflow's "is the .ics
+        # non-empty" check turns that into a skipped publish rather than a failure.
+        if not (deep and result.ok):
+            print(f"skipping {args.ics}: "
+                  f"{'near-term sweep' if not deep else 'fetch not ok'} — "
+                  f"the published feed keeps its full-horizon copy")
+        elif not entries:
+            # A zero-entry feed is still a syntactically valid ~330-byte VCALENDAR, so
+            # nothing downstream would notice it replacing a good one — and Google refetches
+            # a subscribed .ics only every 8-24h, so subscribers would sit on the empty
+            # version for most of a day.
+            print(f"::warning::skipping {args.ics}: 0 entries. Refusing to replace the "
+                  f"published feed with an empty one.")
+        else:
+            from . import ics_export
+            ics_export.write(args.ics, entries, result.notices,
+                             datetime.now(ZoneInfo(config.timezone)))
+            print(f"wrote {args.ics} ({len(entries)} entries)")
+
+    # An untrusted fetch must write NOTHING. Previously this check ran after sync(), so a
+    # suspicious run still inserted and patched, then reported failure.
+    if not result.ok:
+        print("::error::fetch not ok — refusing to write anything to the calendar")
+        _summary_line(f"❌ fetch not ok ({result.lookups_ok} ok / {result.lookups_failed} failed) "
+                      f"— nothing written")
         raise SystemExit(2)
+
+    try:
+        stats = sync(config, result, service=service, dry_run=args.dry_run,
+                     allow_mass_delete=args.allow_mass_delete)
+    except WriteAborted as e:
+        print(f"::error::sync aborted: {e}")
+        _summary_line(f"❌ sync aborted: {e}")
+        raise SystemExit(1)
+
+    line = ("[dry-run] " if args.dry_run else "") + "sync: " + " ".join(
+        f"{k}={v}" for k, v in stats.items() if v)
+    print(line)
+    _summary_line(f"### {'FULL' if deep else 'near'} sweep · {days}d\n"
+                  f"- {len(result.events)} openings → {len(entries)} entries\n"
+                  f"- `{line}`\n"
+                  f"- {result.requests_made} Timely requests "
+                  f"({result.requests_saved} saved by dedup), "
+                  f"{result.lookups_ok}/{result.lookups_expected} lookups ok")
+
+    if service is not None and not args.dry_run:
+        now = datetime.now(ZoneInfo(config.timezone))
+        last_deep = now if deep else marker_last_deep_sweep(read_marker(service, cal_id))
+        write_marker(service, cal_id, checked_at=now, entry_count=len(entries),
+                     last_deep=last_deep)
+
+    failed = write_failures(stats)
+    if failed > max(FAILURE_EXIT_FLOOR, FAILURE_EXIT_SHARE * writes_attempted(stats)):
+        print(f"::error::{failed} write failures out of {writes_attempted(stats)} attempted")
+        raise SystemExit(1)
+    if stats["blocked_delete"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,11 @@ Deposit flags follow the salon's stated policy (cuts/colour/chemical services ta
 we never reach.
 """
 
+# When these prices were last checked against the salon's menu. Rendered in every event
+# description so a reader can judge how much to trust them — the funnel never reaches the
+# payment step, so we can only ever report what the menu said on this date.
+PRICES_AS_OF = "2026-07"
+
 # staff_id -> display name
 STAFF = {
     "287218": "Masa",
@@ -65,6 +70,13 @@ SERVICES = {
     "5319841": {"category": "Junior Barber", "price_display": "$75", "deposit_required": False},
     "5319844": {"category": "Junior Barber", "price_display": "$65", "deposit_required": False},
 }
+
+
+def staff_known(staff_id: str) -> bool:
+    """Whether we can name this person. Unknown staff are skipped rather than published as
+    'Staff 991234' with no role and no price — a placeholder on a public calendar is worse
+    than an absent entry, and the stderr WARN it used to rely on went unread."""
+    return str(staff_id) in STAFF
 
 
 def staff_name(staff_id: str) -> str:

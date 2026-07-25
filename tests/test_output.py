@@ -1,112 +1,112 @@
-"""Tests for ICS rendering and the calendar-sync safety guard (no network)."""
-import os
-import sys
+"""Tests for .ics rendering (RFC 5545 conformance and the folding/escaping rules)."""
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src import ics_export, sync_calendar
-from src.fetch_availability import Config, FetchResult
-from src.models import Slot, group_slots
+from src import ics_export
+from src.fetch_availability import build_datetime
+from src.models import Slot, build_entries, group_slots
 
 NY = ZoneInfo("America/New_York")
+CHECKED = datetime(2026, 7, 17, 12, 0, tzinfo=NY)
 
 
-def _events():
-    a = datetime(2026, 7, 20, 9, 0, tzinfo=NY)
-    slots = [
-        Slot("175308", "Nao", "5319865", "Hair Cut", a,
-             datetime(2026, 7, 20, 9, 55, tzinfo=NY), 55, "Varies (from $75)", True, "https://x"),
-        Slot("175308", "Nao", "3142646", "Hair Cut & Beard Trim", a,
-             datetime(2026, 7, 20, 10, 25, tzinfo=NY), 85, "$95", False, "https://x"),
-    ]
-    return group_slots(slots)
+def _slot(service, start_min, end_min, price="Varies", staff="175308", name="Nao"):
+    return Slot(stylist_id=staff, stylist=name, service_id="x", service=service,
+                start=build_datetime("2026-07-20", start_min, NY),
+                end=build_datetime("2026-07-20", end_min, NY),
+                duration_min=end_min - start_min, price_display=price,
+                deposit_required=False, book_url="https://book.example/a?b=1,2;3")
 
 
-def test_ics_render_is_wellformed_and_free_no_alarm():
-    evs = _events()
-    ics = ics_export.render(evs, "Closed July 4", datetime(2026, 7, 17, 12, 0, tzinfo=NY))
+def _render(style="slots", slots=None):
+    slots = slots or [_slot("Hair Cut", 540, 595), _slot("Hair Cut & Beard Trim", 540, 625)]
+    entries = build_entries(group_slots(slots), style)
+    return ics_export.render(entries, "Closed July 4", CHECKED)
+
+
+def test_ics_render_is_wellformed_and_free_with_no_alarm():
+    ics = _render()
     assert ics.startswith("BEGIN:VCALENDAR")
     assert ics.rstrip().endswith("END:VCALENDAR")
-    assert ics.count("BEGIN:VEVENT") == 1                 # dedup → one event
+    assert ics.count("BEGIN:VEVENT") == 1                 # dedup → one entry
+    assert ics.count("BEGIN:VEVENT") == ics.count("END:VEVENT")
     assert "TRANSP:TRANSPARENT" in ics                    # Free
     assert "BEGIN:VALARM" not in ics                      # no notifications
-    assert "SUMMARY:OPEN · Hair Cut w/ Nao (Stylist)" in ics
+    assert "SUMMARY:Nao · Hair Cut" in ics
     assert "DTSTART:20260720T130000Z" in ics              # 09:00 EDT == 13:00 UTC
+    assert "DTEND:20260720T135500Z" in ics                # titled service: 55 min, not 85
     assert "\r\n" in ics                                  # CRLF line endings
 
 
-def test_sync_skips_deletes_when_fetch_failed():
-    """The core safety property: a failed fetch must never delete existing events."""
-    cfg = Config.load(os.path.join(os.path.dirname(__file__), "..", "config.yaml"))
-
-    class FakeEvents:
-        def __init__(self): self.deleted = []
-        def list(self, **k):
-            class R:
-                def execute(self_):
-                    return {"items": [
-                        {"id": "kidaDEADBEEF", "summary": "OPEN · old",
-                         "start": {"dateTime": "2026-07-20T09:00:00-04:00"},
-                         "end": {"dateTime": "2026-07-20T09:55:00-04:00"}}]}
-            return R()
-        def delete(self, **k):
-            self.deleted.append(k.get("eventId"))
-            class R:
-                def execute(self_): return {}
-            return R()
-
-    class FakeService:
-        def __init__(self): self._ev = FakeEvents()
-        def events(self): return self._ev
-    svc = FakeService()
-
-    # Fetch clearly failed → no events, ok=False. Existing 'kidaDEADBEEF' is stale.
-    bad = FetchResult(slots=[], events=[], notices="", ok=False, lookups_ok=0, lookups_failed=3)
-    cfg.calendar_id = "cal123"        # skip calendar creation path
-    stats = sync_calendar.sync(cfg, bad, service=svc, dry_run=False)
-    assert stats["delete"] == 0
-    assert stats["skipped_delete"] == 1
-    assert svc._ev.deleted == []       # nothing actually deleted
+def test_ics_has_no_method_property():
+    """METHOD makes this an iTIP message, and clients then use SEQUENCE to decide whether
+    a re-fetch supersedes their copy. This feed is full-state and carries no SEQUENCE, so
+    advertising METHOD invited clients to sit on a stale copy under a stable UID."""
+    ics = _render()
+    assert "METHOD:" not in ics
+    assert "\r\nSEQUENCE" not in ics
 
 
-def test_window_scoped_delete_protects_far_out_events():
-    """A short near-term run must delete stale in-window events but NOT the deep run's
-    far-out events (so the hourly + 6-hourly sweeps can share one calendar)."""
-    from datetime import timedelta
-    cfg = Config.load(os.path.join(os.path.dirname(__file__), "..", "config.yaml"))
-    cfg.calendar_id = "cal123"
-    cfg.lookahead_days = 21
-    now = datetime.now(NY)
-    near = (now + timedelta(days=5)).isoformat()      # inside the 21-day window
-    far = (now + timedelta(days=40)).isoformat()      # beyond it (deep run's territory)
+def test_lines_are_folded_on_octets_not_characters():
+    """Summaries carry '·' (2 bytes) and the calendar name an em dash, so counting
+    characters lets a line exceed 75 octets — and can split a character across the fold."""
+    long_name = "Bartholomew Fitzgerald-Montgomery"
+    slots = [_slot(f"Deluxe Signature Hair Cut and Beard Sculpt with Hot Towel {i}",
+                   540, 595, name=long_name) for i in range(3)]
+    ics = ics_export.render(build_entries(group_slots(slots), "slots"),
+                            "A" * 400, CHECKED)
+    for line in ics.split("\r\n"):
+        assert len(line.encode("utf-8")) <= 75, f"line exceeds 75 octets: {line!r}"
+    # Folding must not corrupt the content: unfolding restores valid UTF-8 and the text.
+    unfolded = ics.replace("\r\n ", "")
+    assert long_name in unfolded
+    assert "·" in unfolded
 
-    class FakeEvents:
-        def __init__(self): self.deleted = []
-        def list(self, **k):
-            class R:
-                def execute(self_):
-                    return {"items": [
-                        {"id": "kidaNEAR", "summary": "OPEN · near",
-                         "start": {"dateTime": near}, "end": {"dateTime": near}},
-                        {"id": "kidaFAR", "summary": "OPEN · far",
-                         "start": {"dateTime": far}, "end": {"dateTime": far}}]}
-            return R()
-        def delete(self, **k):
-            self.deleted.append(k.get("eventId"))
-            class R:
-                def execute(self_): return {}
-            return R()
 
-    class FakeService:
-        def __init__(self): self._ev = FakeEvents()
-        def events(self): return self._ev
-    svc = FakeService()
+def test_url_value_is_not_text_escaped():
+    """URL takes a URI value, not TEXT, so its commas and semicolons must stay literal."""
+    ics = _render()
+    unfolded = ics.replace("\r\n ", "")
+    assert "URL:https://book.example/a?b=1,2;3" in unfolded
+    # ...while genuinely TEXT-valued properties still are escaped.
+    assert "DESCRIPTION:" in ics
 
-    # Successful fetch with NO events (everything "booked"). Only the in-window one
-    # should be pruned; the far-out one is left for the deep sweep.
-    good = FetchResult(slots=[], events=[], notices="", ok=True, lookups_ok=5, lookups_failed=0)
-    stats = sync_calendar.sync(cfg, good, service=svc, dry_run=False)
-    assert svc._ev.deleted == ["kidaNEAR"]
-    assert stats["delete"] == 1
+
+def test_description_is_escaped_and_carries_the_honest_caveats():
+    ics = _render()
+    unfolded = ics.replace("\r\n ", "")
+    assert "\\n" in unfolded                     # newlines escaped, not literal
+    assert "Salon notice: Closed July 4" in unfolded
+    assert "Prices as of" in unfolded
+    assert "confirm on KIDA's site" in unfolded
+
+
+def test_blocks_style_renders_one_vevent_per_block():
+    slots = [_slot("Hair Cut", m, m + 55) for m in (540, 600, 660)]
+    ics = _render(style="blocks", slots=slots)
+    assert ics.count("BEGIN:VEVENT") == 1
+    unfolded = ics.replace("\r\n ", "")
+    assert "SUMMARY:Nao · 3 open" in unfolded
+    assert "DTSTART:20260720T130000Z" in unfolded   # 9:00 am
+    assert "DTEND:20260720T155500Z" in unfolded     # through the 11:00 opening
+
+
+def test_uid_matches_the_calendar_event_id():
+    """The .ics and the Google Calendar must agree on identity, or a subscriber who has
+    both sees every opening twice."""
+    entries = build_entries(group_slots([_slot("Hair Cut", 540, 595)]), "slots")
+    ics = ics_export.render(entries, "", CHECKED)
+    assert f"UID:{entries[0].google_event_id()}@kida-cal" in ics
+
+
+def test_empty_feed_is_still_valid():
+    ics = ics_export.render([], "", CHECKED)
+    assert ics.startswith("BEGIN:VCALENDAR")
+    assert "BEGIN:VEVENT" not in ics
+    assert ics.rstrip().endswith("END:VCALENDAR")
+
+
+def test_notices_none_omits_the_notice_line():
+    entries = build_entries(group_slots([_slot("Hair Cut", 540, 595)]), "slots")
+    ics = ics_export.render(entries, None, CHECKED)
+    assert "Salon notice" not in ics

@@ -1,27 +1,49 @@
 # KIDA NYC → open-slots calendar config.
 # See docs/timely-api.md for service/staff ids.
+# Unknown keys are warned about and ignored; invalid values fail the run at startup.
 
-# Deep-sweep window. The hourly workflow overrides this to a shorter near-term window
-# (KIDA_LOOKAHEAD_DAYS) most hours, and uses this full 90 days every 6th hour.
+# Deep-sweep window, and the shorter window most hourly runs use. The program picks
+# between them itself (--depth auto): it goes deep whenever the last deep sweep is older
+# than deep_sweep_every_hours, read off a marker event on the calendar. It does NOT derive
+# the choice from the wall clock — GitHub delivered only 56% of this repo's hourly cron
+# ticks over a measured 180-hour window, and 00:00 UTC never fired once.
 lookahead_days: 90
+near_lookahead_days: 21
+deep_sweep_every_hours: 6
 timezone: America/New_York
+
+# How openings are rendered on the calendar.
+#   blocks  merge each stylist's contiguous same-day openings into one entry, with the
+#           exact bookable start times listed in the description. ~1200 entries over 90
+#           days instead of ~3300, and 9-18 a day instead of up to 81 with 16 overlapping.
+#   slots   one entry per opening (the original behaviour).
+# Switching styles is safe: entries written in the other style are recognised by their id
+# prefix and cleaned up automatically on the next run.
+event_style: blocks
 
 # Which stylists to include. Use "all" or a list of names (case-insensitive).
 # Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto (master barbers) · Hiroki (junior)
+# Staff not listed in src/catalog.py STAFF are skipped rather than published as "Staff 12345".
 stylists: all
 
 # Service allowlist by NAME (case-insensitive substring), or "all" for every online
 # service (cuts, color, highlights, blowout, beard work, deep conditioner, …).
+# Phone-only services (kids haircut / bang trim / keratin) never appear in the online
+# funnel at all, so there is nothing to exclude.
 services: all
 
-exclude_phone_only: true     # kids haircut / bang trim / keratin aren't bookable online anyway
 min_slot_hour: null          # e.g. 18 to only show evening slots (local hour, 0-23)
 weekends_only: false
 
 # Politeness / safety
 request_delay_seconds: 1.0
-max_requests_per_run: 6000     # 90-day × all services × all staff needs headroom
-cache_ttl_seconds: 900       # dev cache for identical (service,staff,month/day) reads
+max_requests_per_run: 6000   # 90-day × all services × all staff, with headroom
+cache_ttl_seconds: 900       # DEV ONLY: CI sets KIDA_CACHE_TTL_SECONDS=0 (it can never hit there)
+
+# A gettimeslots response depends on (staff, date, service duration), not on which service
+# is selected, so identical lookups are served from an in-run memo. This many memo hits per
+# run are re-fetched and compared anyway, so we find out if that ever stops being true.
+verify_dedup_samples: 4
 
 # Google Calendar (live API path). With service-account auth the calendar id is REQUIRED
 # (a service account can't create a calendar in your account): set it here for local use,
@@ -29,7 +51,6 @@ cache_ttl_seconds: 900       # dev cache for identical (service,staff,month/day)
 # Settings → Integrate calendar → Calendar ID.
 calendar_id: null
 calendar_name: "KIDA NYC — Open Slots"
-calendar_color_id: "5"       # a distinct color (banana/yellow)
 
 # Stable public booking link (no per-slot deep link exists — see docs/timely-api.md)
 booking_url: "https://bookings.gettimely.com/kidanyc/bb/book"

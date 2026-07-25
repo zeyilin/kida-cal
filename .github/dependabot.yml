@@ -1,0 +1,34 @@
+version: 2
+
+# Two jobs at once:
+#  1. Action version bumps arrive as reviewable PRs, which is the only sane way to keep
+#     SHA pins current on a workflow that holds a Google write credential.
+#  2. The PR traffic is real repository activity, which resets the ~60-day clock GitHub
+#     uses to auto-disable scheduled workflows. (This replaces keepalive.yml, which
+#     needed a PAT that was never set and therefore never pushed anything.)
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+
+  # Python deps are hash-pinned in requirements-lock.txt / requirements-dev-lock.txt.
+  # Dependabot updates those pins (and their hashes) in place. The loose
+  # requirements*.txt files remain the human-readable inputs; regenerate the locks with
+  # the uv command recorded in each lock file's header after editing them.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps

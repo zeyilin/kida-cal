@@ -7,20 +7,26 @@ name: sync-open-slots
 # Auth: a Google service account (secrets.KIDA_SERVICE_ACCOUNT_JSON). The target calendar
 # (secrets.KIDA_CALENDAR_ID) must be shared with the service account's email with
 # "Make changes to events". See README.
+#
+# This workflow also publishes the .ics feed to GitHub Pages (folded in from the old
+# feed.yml) so the calendar and the feed come from ONE fetch and cannot disagree.
 
 on:
   schedule:
-    # Hourly. Most hours do a fast near-term sweep (next ~3 weeks) so cancellations
-    # surface within the hour. Every 6th hour (00/06/12/18 UTC) does the full 90-day
-    # sweep — that one is ~1h and request-heavy, so it can't run every hour without
-    # Timely rate-limiting us. Delete logic is window-scoped so the two don't fight.
-    - cron: "0 * * * *"
-  workflow_dispatch:           # manual "Run workflow" button
+    # :23 past the hour, deliberately NOT :00. GitHub drops scheduled ticks that cluster
+    # on the top of the hour when the scheduler is loaded — measured on this repo, only
+    # 100 of 180 top-of-hour ticks were ever delivered (p90 gap 175 min).
+    - cron: "23 * * * *"
+  workflow_dispatch:
     inputs:
-      full:
-        description: "Full 90-day sweep (not just the near-term window)"
-        type: boolean
-        default: false
+      depth:
+        description: "Lookahead depth (auto = the program decides from the calendar marker)"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - near
+          - full
 
 # Never run two syncs at once (they'd race on the same events).
 concurrency:
@@ -33,62 +39,243 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # Observed deep (90-day) sweeps take 82-85 min; near-term sweeps 13-14 min. 120 leaves
+    # headroom for a slow Timely day without letting a wedged run burn a full 6 hours.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write # the failure-report step files/comments on an issue
+    outputs:
+      publish: ${{ steps.ics.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Check configuration
-        id: cfg
+      # Hard error, not a green no-op. Scheduled workflows never run on forks, so the
+      # "be friendly to forkers" argument for skipping quietly does not apply here — a
+      # green run that synced nothing is indistinguishable from a working one.
+      - name: Require secrets
         env:
           SA: ${{ secrets.KIDA_SERVICE_ACCOUNT_JSON }}
           CID: ${{ secrets.KIDA_CALENDAR_ID }}
         run: |
-          if [ -z "$SA" ] || [ -z "$CID" ]; then
-            echo "::notice::KIDA_SERVICE_ACCOUNT_JSON / KIDA_CALENDAR_ID not set yet — skipping sync (add secrets to enable). See README Path A."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
+          missing=0
+          if [ -z "$SA" ]; then
+            echo "::error::Secret KIDA_SERVICE_ACCOUNT_JSON is not set. Add the service-account key JSON under Settings → Secrets and variables → Actions. See README Path A."
+            missing=1
           fi
+          if [ -z "$CID" ]; then
+            echo "::error::Secret KIDA_CALENDAR_ID is not set. Add the target calendar id under Settings → Secrets and variables → Actions. See README Path A."
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
 
-      - uses: actions/setup-python@v5
-        if: steps.cfg.outputs.configured == 'true'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements*.txt
 
-      - if: steps.cfg.outputs.configured == 'true'
-        run: pip install -r requirements-calendar.txt
+      # Hash-pinned. This job holds a Google service-account key with write access to a
+      # calendar, so it installs an exact, verified dependency set rather than resolving
+      # whatever is newest on PyPI at 23 past the hour. Regenerate after editing
+      # requirements-calendar.txt with the command in the lock file's header.
+      - name: Install dependencies
+        run: pip install --require-hashes -r requirements-lock.txt
 
+      # $RUNNER_TEMP, never the workspace: the workspace is what gets archived into
+      # artifacts and what a stray `git add -A` would pick up.
       - name: Restore service-account key from secret
-        if: steps.cfg.outputs.configured == 'true'
         env:
-          KIDA_SERVICE_ACCOUNT_JSON_CONTENT: ${{ secrets.KIDA_SERVICE_ACCOUNT_JSON }}
-        run: printf '%s' "$KIDA_SERVICE_ACCOUNT_JSON_CONTENT" > sa-key.json
-
-      - name: Pick lookahead depth
-        if: steps.cfg.outputs.configured == 'true'
-        id: depth
+          SA_JSON: ${{ secrets.KIDA_SERVICE_ACCOUNT_JSON }}
         run: |
-          H=$(date -u +%H)
-          if [ "${{ github.event.inputs.full }}" = "true" ] || [ $((10#$H % 6)) -eq 0 ]; then
-            D=90
-          else
-            D=21
-          fi
-          echo "days=$D" >> "$GITHUB_OUTPUT"
-          echo "::notice::Lookahead this run: $D days"
+          umask 077
+          printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa-key.json"
 
       - name: Sync calendar
-        if: steps.cfg.outputs.configured == 'true'
+        id: sync
         env:
-          KIDA_SERVICE_ACCOUNT_JSON: sa-key.json
+          # 13-85 minutes of silence otherwise, with the progress line buffered until it
+          # lands mid-traceback.
+          PYTHONUNBUFFERED: "1"
+          KIDA_SERVICE_ACCOUNT_JSON: ${{ runner.temp }}/sa-key.json
           KIDA_CALENDAR_ID: ${{ secrets.KIDA_CALENDAR_ID }}
-          KIDA_LOOKAHEAD_DAYS: ${{ steps.depth.outputs.days }}
-        run: python -m src.sync_calendar
+          # The response cache cannot hit in CI: runners start clean, .cache/ is
+          # gitignored, and each key is requested exactly once per run. All it does is
+          # write ~92 MB to a disk that is thrown away minutes later.
+          KIDA_CACHE_TTL_SECONDS: "0"
+          # Dispatch input arrives via env, never interpolated into the shell. Empty for
+          # scheduled runs, so the program's own auto tiering is the default.
+          DEPTH: ${{ github.event.inputs.depth || 'auto' }}
+        run: |
+          mkdir -p public
+          set +e
+          python -m src.sync_calendar \
+            --depth "$DEPTH" \
+            --ics public/open_slots.ics \
+            --fetch-json fetch-result.json
+          code=$?
+          set -e
+          echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then
+            echo "::error::Fetch was untrusted — nothing was written to the calendar (exit 2)."
+          fi
+          exit "$code"
+
+      # Keep the fetch even when the write side blows up, so debugging a 409 or a bad
+      # dedupe doesn't cost another 85-minute Timely sweep.
+      - name: Upload fetch result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fetch-result
+          path: fetch-result.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Check .ics before publishing
+        id: ics
+        run: |
+          f=public/open_slots.ics
+          if [ ! -s "$f" ]; then
+            echo "::notice::$f not written (near-tier sweep, or the program refused it) — keeping the previous deployment live."
+            echo "events=0" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Byte size is not the test: a feed with zero VEVENTs is a perfectly valid ~330
+          # byte VCALENDAR, and publishing it would empty every subscriber's copy for the
+          # 8-24h until Google refetches. Gate on the event count.
+          n=$(grep -c '^BEGIN:VEVENT' "$f" || true)
+          n=${n:-0}
+          echo "events=$n" >> "$GITHUB_OUTPUT"
+          if [ "$n" -lt 1 ]; then
+            echo "::warning::$f has 0 events — refusing to replace the published feed with an empty one."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Pages artifact
+        if: steps.ics.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: public
+
+      - name: Run summary
+        if: always()
+        env:
+          DEPTH: ${{ github.event.inputs.depth || 'auto' }}
+          EXIT_CODE: ${{ steps.sync.outputs.exit-code }}
+          ICS_EVENTS: ${{ steps.ics.outputs.events }}
+          PUBLISH: ${{ steps.ics.outputs.publish }}
+        run: |
+          {
+            echo "### sync-open-slots"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| trigger | \`${GITHUB_EVENT_NAME}\` |"
+            echo "| depth requested | \`${DEPTH}\` |"
+            echo "| sync exit code | \`${EXIT_CODE:-did not run}\` |"
+            echo "| open slots in .ics | ${ICS_EVENTS:-n/a} |"
+            echo "| publishing to Pages | ${PUBLISH:-false} |"
+            echo "| finished (UTC) | $(date -u +'%Y-%m-%d %H:%M:%S') |"
+            echo
+            if [ "${EXIT_CODE:-}" = "2" ]; then
+              echo "> Fetch was untrusted. **Nothing was written to the calendar** — the previous events stand."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up secret on runner
         if: always()
-        run: rm -f sa-key.json
+        run: rm -f "$RUNNER_TEMP/sa-key.json"
+
+      # Dead-man's switch. This is the ONLY thing that notices a dropped cron tick or the
+      # ~60-day scheduled-workflow auto-disable — a run that never starts cannot report
+      # its own absence. Point KIDA_HEARTBEAT_URL at healthchecks.io / cronitor / similar
+      # and have it alert when a ping does not arrive. Optional by design: absent secret
+      # skips cleanly. A failed ping is a warning, not a job failure — the sync itself
+      # succeeded, and the external monitor will alert on the missing ping anyway.
+      - name: Heartbeat
+        if: success()
+        env:
+          HEARTBEAT_URL: ${{ secrets.KIDA_HEARTBEAT_URL }}
+        run: |
+          if [ -z "$HEARTBEAT_URL" ]; then
+            echo "::notice::KIDA_HEARTBEAT_URL not set — no dead-man's switch. Dropped cron ticks and the 60-day auto-disable will go unnoticed."
+            exit 0
+          fi
+          if curl -fsS -m 10 --retry 3 -o /dev/null "$HEARTBEAT_URL"; then
+            echo "Heartbeat sent."
+          else
+            echo "::warning::Heartbeat ping failed (the sync itself succeeded)."
+          fi
+
+      # One issue for a failure streak, not one notification per run: 59 identical
+      # failures become 1 issue + 58 comments. cancelled() is included because a run
+      # cancelled mid-flight (manual cancel, or the concurrency group killing it) is
+      # otherwise completely silent.
+      - name: Report failure
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EXIT_CODE: ${{ steps.sync.outputs.exit-code }}
+        run: |
+          set -uo pipefail
+          gh label create sync-failure \
+            --color B60205 \
+            --description "sync-open-slots is failing (opened automatically)" >/dev/null 2>&1 || true
+
+          body=$(printf '%s\n\n%s\n%s\n%s\n%s\n' \
+            "Run **${JOB_STATUS}** at $(date -u +'%Y-%m-%d %H:%M UTC')." \
+            "- trigger: \`${GITHUB_EVENT_NAME}\`" \
+            "- sync exit code: \`${EXIT_CODE:-did not run}\`" \
+            "- logs: ${RUN_URL}" \
+            "- fetch JSON is attached to that run as the \`fetch-result\` artifact (14-day retention).")
+
+          num=$(gh issue list --label sync-failure --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body "$body"
+            echo "::notice::Commented on existing failure issue #${num}"
+          else
+            gh issue create \
+              --title "sync-open-slots is failing" \
+              --label sync-failure \
+              --body "$body"
+          fi
+
+  # The published .ics must always cover the full horizon, so only a deep sweep may
+  # rewrite it: a near-tier run only knows about the next ~3 weeks, and since Google
+  # re-fetches a subscribed .ics only every 8-24h, letting near runs publish would mean
+  # subscribers almost always got the truncated version.
+  #
+  # The program enforces that itself — it skips the --ics write entirely on a near-tier
+  # run — so the workflow needs no knowledge of which tier ran. The `publish` gate simply
+  # observes that no .ics was produced and skips the deploy, leaving the previous, complete
+  # deployment live. Same gate also protects against an empty or truncated file.
+  deploy-pages:
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # Pages allows one deployment at a time; this group is scoped to the deploy job only
+    # so it can never interfere with the sync concurrency group.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
 
 # Note: GitHub disables scheduled workflows after ~60 days with no repository activity
-# (Actions-bot commits don't count). If that happens GitHub emails you — click
-# "Enable workflow", or push any commit, to resume.
+# (Actions-bot commits don't count). Dependabot's weekly PRs (.github/dependabot.yml) are
+# the activity that keeps this alive; the heartbeat above is what tells you if it stops.

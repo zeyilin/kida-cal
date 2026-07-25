@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from . import ics_export
 from .fetch_availability import Config, fetch
+from .models import build_entries
 
 
 def main():
@@ -33,8 +34,9 @@ def main():
 
     cfg = Config.load(args.config)
     result = fetch(cfg)
-    print(f"fetched: ok={result.ok} lookups ok={result.lookups_ok} "
-          f"failed={result.lookups_failed} → {len(result.events)} events")
+    print(f"fetched: ok={result.ok} lookups ok={result.lookups_ok}/{result.lookups_expected} "
+          f"failed={result.lookups_failed} → {len(result.events)} events "
+          f"({result.requests_made} requests)")
     if result.errors:
         for e in result.errors[:5]:
             print("  err:", e, file=sys.stderr)
@@ -48,8 +50,10 @@ def main():
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     checked_at = datetime.now(ZoneInfo(cfg.timezone))
-    ics_export.write(args.out, result.events, result.notices, checked_at)
-    print(f"wrote {args.out} with {len(result.events)} events (checked {checked_at:%Y-%m-%d %H:%M %Z})")
+    entries = build_entries(result.events, cfg.event_style)
+    ics_export.write(args.out, entries, result.notices, checked_at)
+    print(f"wrote {args.out} with {len(entries)} entries from {len(result.events)} openings "
+          f"(checked {checked_at:%Y-%m-%d %H:%M %Z})")
 
 
 if __name__ == "__main__":

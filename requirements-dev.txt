@@ -1,0 +1,5 @@
+# Test-only dependencies. Deliberately NOT in requirements.txt — that file is installed
+# by the production sync job, which holds a Google service-account key; every package
+# added there widens the supply-chain surface of a credential-bearing job.
+-r requirements-calendar.txt
+pytest>=8.0

@@ -13,13 +13,20 @@ deep_sweep_every_hours: 6
 timezone: America/New_York
 
 # How openings are rendered on the calendar.
-#   blocks  merge each stylist's contiguous same-day openings into one entry, with the
-#           exact bookable start times listed in the description. ~1200 entries over 90
-#           days instead of ~3300, and 9-18 a day instead of up to 81 with 16 overlapping.
 #   slots   one entry per opening (the original behaviour).
-# Switching styles is safe: entries written in the other style are recognised by their id
-# prefix and cleaned up automatically on the next run.
-event_style: blocks
+#   blocks  merge each stylist's contiguous same-day openings into one entry, with the
+#           exact bookable start times listed in the description. On real captured data:
+#           418 openings -> 126 entries, and the busiest day drops from 41 to 10.
+#
+# Deliberately on `slots` for now. This is a staged rollout: the 409 fix and the delete
+# guards ship first with ZERO visual change, so "is the outage fixed?" can be answered
+# before "do I like the new layout?". Flip to `blocks` in a separate commit once a clean
+# run has been observed.
+#
+# Switching is safe in either direction: entries written in the other style are recognised
+# by their id prefix and retired only AFTER their replacements are live, only within this
+# run's window, and only when enough replacements actually landed.
+event_style: slots
 
 # Which stylists to include. Use "all" or a list of names (case-insensitive).
 # Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto (master barbers) · Hiroki (junior)

@@ -209,7 +209,8 @@ def test_consecutive_failures_trip_the_breaker():
 
 
 # --------------------------------------------------------------- delete guards
-def test_skips_all_deletes_when_fetch_failed():
+@pytest.mark.parametrize("style", ["slots", "blocks"])
+def test_skips_all_deletes_when_fetch_failed(style):
     """The core safety property: a failed fetch must never delete existing events."""
     cfg = mkconfig()
     gone = _event()
@@ -222,7 +223,8 @@ def test_skips_all_deletes_when_fetch_failed():
     assert svc.methods("delete") == []
 
 
-def test_window_scoped_delete_protects_far_out_events():
+@pytest.mark.parametrize("style", ["slots", "blocks"])
+def test_window_scoped_delete_protects_far_out_events(style):
     """A short near-term run must prune stale in-window events but NOT the deep run's
     far-out ones, so the hourly and 6-hourly sweeps can share one calendar."""
     cfg = mkconfig(lookahead_days=21)
@@ -236,8 +238,9 @@ def test_window_scoped_delete_protects_far_out_events():
     assert stats["delete"] == 1
 
 
-def test_blast_radius_guard_refuses_a_mass_delete():
-    cfg = mkconfig()
+@pytest.mark.parametrize("style", ["slots", "blocks"])
+def test_blast_radius_guard_refuses_a_mass_delete(style):
+    cfg = mkconfig(event_style=style)
     events = _events(80)
     svc = FakeCalendarService(events=[_existing_from(e, cfg) for e in events])
 
@@ -249,8 +252,9 @@ def test_blast_radius_guard_refuses_a_mass_delete():
     assert svc.methods("delete") == []
 
 
-def test_allow_mass_delete_overrides_the_guard():
-    cfg = mkconfig()
+@pytest.mark.parametrize("style", ["slots", "blocks"])
+def test_allow_mass_delete_overrides_the_guard(style):
+    cfg = mkconfig(event_style=style)
     events = _events(80)
     svc = FakeCalendarService(events=[_existing_from(e, cfg) for e in events])
 
@@ -274,8 +278,9 @@ def test_blast_radius_denominator_is_in_window_not_whole_calendar():
     assert stats["blocked_delete"] == 60
 
 
-def test_guard_allows_normal_churn():
-    cfg = mkconfig()
+@pytest.mark.parametrize("style", ["slots", "blocks"])
+def test_guard_allows_normal_churn(style):
+    cfg = mkconfig(event_style=style)
     events = _events(80)
     svc = FakeCalendarService(events=[_existing_from(e, cfg) for e in events])
 

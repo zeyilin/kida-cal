@@ -429,6 +429,56 @@ def test_changeover_is_refused_when_the_replacement_set_is_implausible():
     assert stats["insert"] == 5
 
 
+def test_a_real_slots_to_blocks_changeover_is_not_refused():
+    """The guard must size replacements in OPENINGS, not entries.
+
+    Blocks encode the same availability in ~3.3x fewer entries by design (measured on real
+    captured data: 418 openings -> 126 entries). An entry-count guard would refuse this
+    healthy migration and leave BOTH styles live on the calendar at once — which is what
+    the production numbers would have done: 3414 openings -> ~1030 blocks against 3413
+    legacy entries needs 1707 to clear an entry-count threshold.
+    """
+    cfg = mkconfig(event_style="blocks")
+    # 40 stylists x 6 contiguous hourly openings = 240 openings that merge into 40 blocks.
+    events = [_event(stylist_id=f"s{i}", stylist=f"S{i}", days_ahead=3, hour=9 + h)
+              for i in range(40) for h in range(6)]
+    svc = FakeCalendarService(events=_legacy_calendar(events))
+    assert len(svc.store) == 240
+
+    stats = sync_calendar.sync(cfg, _result(events), service=svc)
+
+    assert stats["insert"] == 40              # far fewer entries than we retired...
+    assert stats["migrated"] == 240           # ...yet the migration still proceeds
+    assert stats["blocked_delete"] == 0
+    live = svc.live()
+    assert len(live) == 40
+    assert all(eid.startswith("kidav") for eid in live)
+
+
+def test_a_changeover_losing_most_openings_is_still_refused():
+    """The openings-based guard must not become a rubber stamp: a fetch that lost most of
+    its data still has to be caught, even though blocks legitimately shrink entry counts."""
+    cfg = mkconfig(event_style="blocks")
+    events = [_event(stylist_id=f"s{i}", stylist=f"S{i}", days_ahead=3, hour=9 + h)
+              for i in range(40) for h in range(6)]
+    svc = FakeCalendarService(events=_legacy_calendar(events))
+
+    # Only 5 stylists' worth of openings came back (30 of 240).
+    stats = sync_calendar.sync(cfg, _result(events[:30]), service=svc)
+
+    assert stats["migrated"] == 0
+    assert stats["blocked_delete"] == 240
+    assert len([e for e in svc.live() if not e.startswith("kidav")]) == 240
+
+
+def test_opening_count_is_the_unit_that_survives_a_style_change():
+    ev = _event()
+    assert ev.opening_count == 1
+    block = build_entries([_event(days_ahead=3, hour=9), _event(days_ahead=3, hour=10)],
+                          "blocks")[0]
+    assert block.opening_count == 2
+
+
 def test_changeover_proceeds_when_replacements_actually_landed():
     cfg = mkconfig(event_style="blocks")
     events = _events(80)

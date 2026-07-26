@@ -40,6 +40,12 @@ def _events(n, days_from=1):
             for i in range(n)]
 
 
+def _window(n, days=18, day_from=1):
+    """n openings that all fall inside even the 21-day window, each its own entry."""
+    return [_event(stylist_id=f"w{i}", stylist=f"W{i}", days_ahead=day_from + (i % days))
+            for i in range(n)]
+
+
 def _result(events, ok=True, notices="", staff_ok=None):
     return FetchResult(slots=[], events=list(events), notices=notices, ok=ok,
                        lookups_ok=60 if ok else 0, lookups_failed=0 if ok else 60,
@@ -48,6 +54,15 @@ def _result(events, ok=True, notices="", staff_ok=None):
 
 def _entry(ev, config):
     return build_entries([ev], config.event_style)[0]
+
+
+def _existing_entry(entry, config, notices=""):
+    """Calendar item for an ALREADY-BUILT entry (Event or Block).
+
+    _existing_from() takes a raw opening and builds the entry itself; passing it a Block
+    would re-wrap it, yielding a one-opening entry whose `openings` stamp is wrong.
+    """
+    return dict(sync_calendar.entry_body(entry, config, notices), status="confirmed")
 
 
 def _existing_from(ev, config, notices=""):
@@ -255,51 +270,51 @@ def test_window_scoped_delete_protects_far_out_events(style):
 @pytest.mark.parametrize("style", ["slots", "blocks"])
 def test_blast_radius_guard_refuses_a_mass_delete(style):
     cfg = mkconfig(event_style=style)
-    events = _events(80)
+    events = _window(200)          # 200 openings, comfortably over DELETE_BLAST_MIN
     svc = FakeCalendarService(events=[_existing_from(e, cfg) for e in events])
 
     # A "successful" fetch that somehow lost almost everything.
     stats = sync_calendar.sync(cfg, _result(events[:5]), service=svc)
 
     assert stats["delete"] == 0
-    assert stats["blocked_delete"] == 75
+    assert stats["blocked_delete"] == 195
     assert svc.methods("delete") == []
 
 
 @pytest.mark.parametrize("style", ["slots", "blocks"])
 def test_allow_mass_delete_overrides_the_guard(style):
     cfg = mkconfig(event_style=style)
-    events = _events(80)
+    events = _window(200)
     svc = FakeCalendarService(events=[_existing_from(e, cfg) for e in events])
 
     stats = sync_calendar.sync(cfg, _result(events[:5]), service=svc,
                                allow_mass_delete=True)
-    assert stats["delete"] == 75
+    assert stats["delete"] == 195
 
 
 def test_blast_radius_denominator_is_in_window_not_whole_calendar():
     """With a whole-calendar denominator, a 21-day run seeing ~350 of ~3300 events could
     delete every single one of them and still look like a ~10% change."""
     cfg = mkconfig(lookahead_days=21)
-    in_window = [_event(stylist_id=f"w{i}", days_ahead=1 + (i % 18)) for i in range(60)]
+    in_window = [_event(stylist_id=f"w{i}", days_ahead=1 + (i % 18)) for i in range(200)]
     far = [_event(stylist_id=f"f{i}", days_ahead=40 + (i % 45)) for i in range(300)]
     svc = FakeCalendarService(
         events=[_existing_from(e, cfg) for e in in_window + far])
 
     stats = sync_calendar.sync(cfg, _result([]), service=svc)
 
-    assert stats["delete"] == 0            # blocked: 60 of 60 in-window is a wipe
-    assert stats["blocked_delete"] == 60
+    assert stats["delete"] == 0            # blocked: 200 of 200 in-window is a wipe
+    assert stats["blocked_delete"] == 200
 
 
 @pytest.mark.parametrize("style", ["slots", "blocks"])
 def test_guard_allows_normal_churn(style):
     cfg = mkconfig(event_style=style)
-    events = _events(80)
+    events = _window(200)
     svc = FakeCalendarService(events=[_existing_from(e, cfg) for e in events])
 
     stats = sync_calendar.sync(cfg, _result(events[10:]), service=svc)
-    assert stats["delete"] == 10           # 12.5% churn is routine
+    assert stats["delete"] == 10           # 5% churn is routine
     assert stats["blocked_delete"] == 0
 
 
@@ -694,6 +709,99 @@ def test_past_events_are_pruned_without_counting_toward_the_guard():
     assert stats["blocked_delete"] == 0
     assert stats["delete"] == 200          # all the past ones, none of the upcoming
     assert stats["unchanged"] == 60
+
+
+# ------------------------------------------------- re-keying (blocks-specific)
+def _block_day(stylist, day, hours):
+    """One stylist-day's openings, which `blocks` merges into a single entry."""
+    return [_event(stylist_id=stylist, stylist=stylist, days_ahead=day, hour=h)
+            for h in hours]
+
+
+def test_a_rekeyed_block_is_deleted_only_after_its_replacement_is_live():
+    """Block ids key on the first opening, so booking that opening re-keys the whole block
+    into a delete+insert. Deleting first removes still-bookable availability."""
+    cfg = mkconfig(event_style="blocks")
+    before = _block_day("nao", 3, [9, 10, 11, 12])
+    after = _block_day("nao", 3, [10, 11, 12])        # the 9:00 got booked
+    svc = FakeCalendarService(events=[_existing_entry(e, cfg)
+                                      for e in build_entries(before, "blocks")])
+
+    sync_calendar.sync(cfg, _result(after, staff_ok={"nao"}), service=svc)
+
+    writes = [m for m, _ in svc.calls if m in ("delete", "insert")]
+    assert writes.index("insert") < writes.index("delete"), \
+        "the replacement block must be live before the superseded one is removed"
+    live = svc.live()
+    assert len(live) == 1
+    assert "3 open" in next(iter(live.values()))["summary"]
+
+
+def test_a_failed_replacement_keeps_the_old_block_rather_than_going_dark():
+    """The harm this ordering prevents: delete lands, insert fails, and the stylist's whole
+    day is advertised nowhere while the run still exits 0."""
+    cfg = mkconfig(event_style="blocks")
+    before = _block_day("nao", 3, [9, 10, 11, 12])
+    after = _block_day("nao", 3, [10, 11, 12])
+    new_id = build_entries(after, "blocks")[0].google_event_id()
+    svc = FakeCalendarService(
+        events=[_existing_entry(e, cfg) for e in build_entries(before, "blocks")],
+        fail_plan={("insert", new_id): [http_error(500, "Server Error", "backendError")]})
+
+    stats = sync_calendar.sync(cfg, _result(after, staff_ok={"nao"}), service=svc)
+
+    assert stats["failed_insert"] == 1
+    assert stats["skipped_delete"] == 1
+    assert len(svc.live()) == 1, "the day must still be represented by SOMETHING"
+
+
+def test_a_genuine_booking_is_still_deleted_first():
+    """The re-key deferral must not blunt the urgent case: a stylist-day that has left the
+    feed entirely is an advertised appointment that is already taken."""
+    cfg = mkconfig(event_style="blocks")
+    gone = _block_day("sachi", 4, [9, 10])
+    other = _block_day("nao", 5, [9, 10])
+    svc = FakeCalendarService(events=[_existing_entry(e, cfg)
+                                      for e in build_entries(gone + other, "blocks")])
+
+    sync_calendar.sync(cfg, _result(other, staff_ok={"nao", "sachi"}), service=svc)
+
+    writes = [m for m, _ in svc.calls if m in ("delete", "insert")]
+    assert writes and writes[0] == "delete"
+
+
+def test_withholding_is_symmetric_so_a_day_is_never_double_published():
+    """Suppressing a stylist's deletes while still inserting their new entries publishes
+    two overlapping blocks for the same day, the older still advertising a booked slot."""
+    cfg = mkconfig(event_style="blocks")
+    before = _block_day("sick", 3, [9, 10, 11, 12])
+    after = _block_day("sick", 3, [10, 11, 12])
+    svc = FakeCalendarService(events=[_existing_entry(e, cfg)
+                                      for e in build_entries(before, "blocks")])
+
+    # 'sick' is not in staff_ok: we cannot see them completely this run.
+    stats = sync_calendar.sync(cfg, _result(after, staff_ok={"nao"}), service=svc)
+
+    assert len(svc.live()) == 1, "must not publish two overlapping blocks for one day"
+    assert stats["insert"] == 0 and stats["patch"] == 0
+    assert stats["skipped_delete"] >= 1
+
+
+def test_blast_floor_is_measured_in_openings_not_entries():
+    """A window of few block ENTRIES can still be a lot of availability. An entry-based
+    floor let a small-entry-count calendar be wiped with the guard silent."""
+    cfg = mkconfig(event_style="blocks")
+    # 18 stylist-days x 10 openings = 180 openings in only 18 entries.
+    evs = [e for i in range(18) for e in _block_day(f"s{i}", 1 + i, range(9, 19))]
+    entries = build_entries(evs, "blocks")
+    assert len(entries) < sync_calendar.DELETE_BLAST_MIN      # few entries...
+    assert sum(e.opening_count for e in entries) >= sync_calendar.DELETE_BLAST_MIN
+    svc = FakeCalendarService(events=[_existing_entry(e, cfg) for e in entries])
+
+    stats = sync_calendar.sync(cfg, _result([]), service=svc)
+
+    assert stats["delete"] == 0                              # ...but the guard still fires
+    assert stats["blocked_delete"] == len(entries)
 
 
 # --------------------------------------------------------------- depth + marker

@@ -71,9 +71,14 @@ SERVICE_ACCOUNT_ENV = "KIDA_SERVICE_ACCOUNT_JSON"     # path to service-account 
 API_RETRIES = 5              # handled inside googleapiclient: jittered backoff on 429/5xx
 MAX_CONSECUTIVE_FAILURES = 25   # circuit breaker: stop grinding through a systemic failure
 DELETE_BLAST_RADIUS = 0.5       # refuse a delete pass larger than this share of the window
-DELETE_BLAST_MIN = 50           # ...but only once the window is big enough to judge
+DELETE_BLAST_MIN = 150          # ...but only once the window is big enough to judge.
+                                # Measured in OPENINGS: the live 21-day window is ~97
+                                # block entries but ~303 openings, and openings are the
+                                # only unit that does not move when event_style does.
 FAILURE_EXIT_FLOOR = 5          # below this many write failures, still exit 0
 FAILURE_EXIT_SHARE = 0.05
+SKIPPED_DELETE_EXIT_FLOOR = 10  # withholding a few deletes is routine; withholding many
+                                # means a stylist is stale on a public calendar
 
 
 class WriteAborted(RuntimeError):
@@ -422,6 +427,11 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     # blip as "banner cleared" would rewrite all ~3300 events, then rewrite them back next run.
     compare_description = result.notices is not None
     desired = {e.google_event_id(): entry_body(e, config, result.notices) for e in entries}
+    # Side tables keyed the same way as `desired`, so the write passes can reason about an
+    # entry's stylist and day without re-deriving them from the body.
+    _entry_stylist = {e.google_event_id(): str(e.stylist_id) for e in entries}
+    _entry_day = {e.google_event_id(): (str(e.stylist_id), e.start.date()) for e in entries}
+    _desired_days = set(_entry_day.values())
 
     stats = {"insert": 0, "revive": 0, "patch": 0, "delete": 0, "migrated": 0,
              "unchanged": 0, "skipped_delete": 0, "blocked_delete": 0,
@@ -506,6 +516,20 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
                   f"lookups failed this run; they keep their entries until we can see them")
             stats["skipped_delete"] += len(held)
             future_stale = [e for e in future_stale if e not in held]
+        # Withholding must be SYMMETRIC. Suppressing a stylist's deletes while still
+        # inserting their new entries publishes two overlapping blocks for the same
+        # stylist-day, the older one still advertising an opening we know is booked.
+        # If we cannot see someone completely, we leave their whole day alone.
+        blind = {who for who in
+                 {_stylist_of(existing[eid]) for eid in held} if who is not None}
+        if blind:
+            dropped = [eid for eid, b in desired.items()
+                       if str(_entry_stylist[eid]) in blind]
+            if dropped:
+                print(f"::warning::also withholding {len(dropped)} write(s) for those "
+                      f"stylists, so their day is not double-published")
+                for eid in dropped:
+                    desired.pop(eid, None)
         # The changeover purge needs the SAME authority. It is the one delete path that
         # runs when `existing` is empty by construction, so the check above cannot fire
         # for it — and a changeover is exactly when a half-seen stylist would otherwise be
@@ -528,7 +552,13 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
               f"skipping {len(stale) + len(obsolete_in_window)} deletes to avoid wiping "
               f"the calendar")
         blocked = True
-    elif (not allow_mass_delete and len(future_in_window) >= DELETE_BLAST_MIN
+    # Size the floor in OPENINGS, not entries. Under `blocks` the 21-day window is ~97
+    # entries but ~303 openings, so an entry floor of 50 sits only 1.9x away — and
+    # weekends_only, a min_slot_hour filter, or two stylists on leave would drop it under
+    # the floor, silently disabling the guard entirely on exactly the calendars where a
+    # wipe is least recoverable.
+    elif (not allow_mass_delete
+            and sum(_openings_of(existing[e]) for e in future_in_window) >= DELETE_BLAST_MIN
             and len(future_stale) > DELETE_BLAST_RADIUS * len(future_in_window)):
         stats["blocked_delete"] = len(future_stale)
         print(f"::error::refusing to delete {len(future_stale)} of {len(future_in_window)} "
@@ -581,9 +611,33 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
         stats[stat_key] += 1
         consecutive = 0
 
+    # A stale id falls into one of two very different cases, and they must not share an
+    # ordering:
+    #
+    #   BOOKED  — nothing in the feed covers that stylist-day any more. The entry is a
+    #             publicly advertised appointment that is already taken. Delete it FIRST;
+    #             that urgency is the whole reason deletes precede inserts.
+    #   RE-KEY  — the stylist-day IS still in the feed, under a different id. Under
+    #             `blocks` this happens constantly: the id is keyed on the block's first
+    #             opening, so booking (or merely passing) that opening re-keys the block.
+    #             Deleting first here removes still-bookable availability, and if the
+    #             replacement insert then fails the whole day is advertised nowhere while
+    #             the run still exits 0.
+    #
+    # So re-keys are deleted LAST, after their replacement is live — the same discipline
+    # the changeover purge uses.
+    def _is_rekey(eid: str) -> bool:
+        who = _stylist_of(existing[eid])
+        d = starts.get(eid)
+        return (who is not None and d is not None
+                and (who, d.date()) in _desired_days)
+
+    booked = [eid for eid in stale if not _is_rekey(eid)]
+    rekeyed = [eid for eid in stale if _is_rekey(eid)]
+
     # ---- 1. deletes, first: a stale event is a publicly advertised booked appointment ----
     if not blocked:
-        for eid in stale:
+        for eid in booked:
             do_delete(eid, "delete")
 
     # ---- 2. patches ----
@@ -630,6 +684,26 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
             continue
         stats["insert"] += 1
         consecutive = 0
+
+    # ---- 3b. re-keyed entries, now that their replacement is live ----
+    # Each of these is an entry whose stylist-day is still in the feed under a new id. The
+    # replacement insert has already run, so deleting now can never leave the day
+    # unrepresented — and if that insert failed, we keep the old entry instead of the day
+    # going dark.
+    if not blocked and rekeyed:
+        kept = 0
+        for eid in rekeyed:
+            replacement = next((k for k, day in _entry_day.items()
+                                if day == (_stylist_of(existing[eid]), starts[eid].date())),
+                               None)
+            if replacement is not None and replacement in failed_ids:
+                kept += 1
+                stats["skipped_delete"] += 1
+                continue
+            do_delete(eid, "delete")
+        if kept:
+            print(f"::warning::kept {kept} superseded entr(ies) whose replacement failed to "
+                  f"write — better a stale entry than an unrepresented day")
 
     # ---- 4. the event_style changeover purge, LAST and separately guarded ----
     # These are entries written under the other style. They run after the inserts, not with
@@ -746,7 +820,10 @@ def _summary_line(text: str) -> None:
 
 
 # ---------------------------------------------------------------- CLI
-def main():
+def main(argv=None):
+    """Entry point. `argv` is a test seam: tests drive the decision points here — the
+    untrusted-fetch write refusal, the exit codes, the .ics gating, the marker stamp —
+    without patching sys.argv."""
     ap = argparse.ArgumentParser(description="Sync KIDA NYC open slots to Google Calendar")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the insert/patch/delete diff without writing")
@@ -760,9 +837,13 @@ def main():
                     help="skip the Timely fetch and load a previous result from this path")
     ap.add_argument("--allow-mass-delete", action="store_true",
                     help="bypass the delete blast-radius guard (manual recovery only)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     config = Config.load(args.config)
+    # The configured DEEP window, captured before resolve_depth overwrites lookahead_days
+    # with this run's tier. Anything asking "was this really a full sweep?" must compare
+    # against this, not against the already-resolved value.
+    deep_window = config.lookahead_days
     print(f"config: {config.describe()}")
 
     service = None
@@ -798,6 +879,12 @@ def main():
                   f"run resolved {config.lookahead_days}; using the captured window so the "
                   f"replay cannot delete events it never looked for")
             config.lookahead_days = int(captured)
+        # ...and it is only a DEEP sweep if the capture actually covered the deep window.
+        # Otherwise a `--depth full --from-json <near capture>` replay — the natural thing
+        # to run while debugging an incident — republishes a truncated .ics over the full
+        # feed and stamps last_deep_sweep, suppressing the real sweep for hours.
+        if captured:
+            deep = int(captured) >= deep_window
         print(f"loaded {len(result.events)} events from {args.from_json} "
               f"({config.lookahead_days}-day window)")
     else:
@@ -895,6 +982,13 @@ def main():
         print(f"::error::{failed} write failures out of {writes_attempted(stats)} attempted")
         raise SystemExit(1)
     if stats["blocked_delete"]:
+        raise SystemExit(1)
+    # A run that refused a large share of its deletes did not do its job, even though every
+    # call it made succeeded. Reporting green there is how a partial outage stays invisible.
+    if stats["skipped_delete"] > SKIPPED_DELETE_EXIT_FLOOR:
+        print(f"::error::{stats['skipped_delete']} deletes were withheld this run "
+              f"(stylists we could not see completely, or replacements that failed to "
+              f"write). The calendar is stale for those people.")
         raise SystemExit(1)
 
 

@@ -211,6 +211,22 @@ jobs:
             echo "::warning::Heartbeat ping failed (the sync itself succeeded)."
           fi
 
+      # Clear the failure issue on recovery. Without this the issue latches open forever
+      # and "is there an open sync-failure issue?" stops being a signal at all — which is
+      # exactly what happened after two deliberately-cancelled runs left #5 standing while
+      # every subsequent sync was green.
+      - name: Clear failure issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          for num in $(gh issue list --label sync-failure --state open --json number --jq '.[].number'); do
+            gh issue close "$num" --comment "Recovered: [this run](${RUN_URL}) succeeded." >/dev/null 2>&1 \
+              && echo "::notice::Closed recovered failure issue #${num}"
+          done
+
       # One issue for a failure streak, not one notification per run: 59 identical
       # failures become 1 issue + 58 comments. cancelled() is included because a run
       # cancelled mid-flight (manual cancel, or the concurrency group killing it) is

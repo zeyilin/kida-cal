@@ -31,6 +31,12 @@ UA = "kida-cal/0.2 (+personal read-only availability mirror; contact via repo is
 # The next cron tick will retry. Sleeping on an unbounded Retry-After let a single response
 # hold the job open for hours.
 MAX_RETRY_AFTER_SECONDS = 120
+# The funnel's two POST steps are what Timely actually rate-limits — observed 429ing the
+# same two /Booking/Service calls on every run, through all 5 retries, while the GET reads
+# sail through. They are ~48 requests of a ~400-request run, so paying a few extra seconds
+# each costs little and is the polite response to being told to slow down.
+POST_EXTRA_DELAY_SECONDS = 3.0
+
 # Consecutive fully-throttled REQUESTS (each having already spent all 5 retries) across the
 # whole run that mean "we are not welcome right now". Must stay above the retry-loop length
 # so that a single stubborn url cannot end the sweep on its own.
@@ -92,12 +98,12 @@ class _Budget:
         self.made = 0
         self.throttles = 0
 
-    def tick(self):
+    def tick(self, extra_delay: float = 0.0):
         if self.made >= self.cap:
             raise BudgetExhausted(
                 f"request cap reached ({self.cap}) — the rest of this run's availability was "
                 f"never fetched. Raise max_requests_per_run only if that is genuinely safe.")
-        wait = self.delay - (time.monotonic() - self._last)
+        wait = (self.delay + extra_delay) - (time.monotonic() - self._last)
         if wait > 0:
             time.sleep(wait)
         self._last = time.monotonic()
@@ -217,7 +223,8 @@ class TimelyClient:
         self.cache_ns = cache_ns
 
     # -- HTTP with backoff -------------------------------------------------
-    def _request(self, method, url, *, xhr=False, data=None, cache_key=None):
+    def _request(self, method, url, *, xhr=False, data=None, cache_key=None,
+                 extra_delay=0.0):
         if cache_key and self.cache:
             hit = self.cache.get(cache_key)
             if hit is not None:
@@ -227,7 +234,7 @@ class TimelyClient:
             headers["X-Requested-With"] = "XMLHttpRequest"
         backoff = 2.0
         for attempt in range(5):
-            BUDGET.tick()
+            BUDGET.tick(extra_delay)
             resp = self.session.request(method, url, data=data, headers=headers, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504):
                 retry_after = None
@@ -279,11 +286,13 @@ class TimelyClient:
     def select_service(self, bookable_item_id: str, service_staff_ids: dict):
         form = {"LocationId": "0", "BookableTimeSlotItemIds": bookable_item_id, "commit": ""}
         form.update(service_staff_ids)
-        self._request("POST", f"{BASE}/Booking/Service?obg={self.obg}", data=form)
+        self._request("POST", f"{BASE}/Booking/Service?obg={self.obg}", data=form,
+                      extra_delay=POST_EXTRA_DELAY_SECONDS)
 
     def select_staff(self, staff_id: str):
         self._request("POST", f"{BASE}/Booking/StaffSelection?obg={self.obg}",
-                      data={"SelectedStaffId": str(staff_id), "commit": ""})
+                      data={"SelectedStaffId": str(staff_id), "commit": ""},
+                      extra_delay=POST_EXTRA_DELAY_SECONDS)
 
     def open_dates(self, staff_id: str, month: int, year: int) -> list[dict]:
         url = (f"{BASE}/Booking/GetOpenDates?obg={self.obg}&month={month}&year={year}"

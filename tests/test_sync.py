@@ -399,6 +399,38 @@ def test_description_is_not_compared_when_the_notices_scrape_failed():
     assert svc.methods("patch") == []
 
 
+def test_an_incomplete_fetch_does_not_rewrite_descriptions():
+    """Timely persistently 429s two /Booking/Service POSTs. Those services then vanish from
+    every affected description, and the next successful run puts them back — ~16 entries
+    flip-flopping between two states every hour. A failed lookup means we do not KNOW
+    whether that service is bookable, which is not the same as knowing it is not."""
+    cfg = mkconfig()
+    ev = _event()
+    rich = dict(sync_calendar.entry_body(_entry(ev, cfg), cfg, ""), status="confirmed")
+    rich["description"] += "\nHair Cut & Beard Trim (85m) — $95: 10:00 AM"
+    svc = FakeCalendarService(events=[rich])
+
+    partial = FetchResult(slots=[], events=[ev], notices="", ok=True,
+                          lookups_ok=58, lookups_failed=2, lookups_expected=60)
+    stats = sync_calendar.sync(cfg, partial, service=svc)
+
+    assert stats["patch"] == 0
+    assert stats["unchanged"] == 1
+    assert "Beard Trim" in svc.live()[_entry(ev, cfg).google_event_id()]["description"]
+
+
+def test_a_complete_fetch_does_rewrite_descriptions():
+    cfg = mkconfig()
+    ev = _event()
+    stale = dict(sync_calendar.entry_body(_entry(ev, cfg), cfg, ""), status="confirmed")
+    stale["description"] += "\nA service that is genuinely gone"
+    svc = FakeCalendarService(events=[stale])
+
+    stats = sync_calendar.sync(cfg, _result([ev]), service=svc)   # 60/60 lookups
+    assert stats["patch"] == 1
+    assert "genuinely gone" not in svc.live()[_entry(ev, cfg).google_event_id()]["description"]
+
+
 def test_a_real_notice_change_still_patches():
     cfg = mkconfig()
     ev = _event()

@@ -425,7 +425,16 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     # A failed notices scrape returns None (distinct from "" for a genuinely empty banner).
     # The banner text is an input to every description, so treating a 20-second kidanyc.com
     # blip as "banner cleared" would rewrite all ~3300 events, then rewrite them back next run.
-    compare_description = result.notices is not None
+    # Descriptions are only rewritten when we saw EVERY service. A failed service lookup
+    # means we do not know whether it is bookable — not that it isn't — and dropping it
+    # from the description asserts the stronger claim. Timely persistently 429s two
+    # /Booking/Service POSTs, so without this ~16 entries flip-flop between two description
+    # states every hour: the service vanishes on a failed run and returns on the next.
+    complete = result.lookups_failed == 0
+    compare_description = result.notices is not None and complete
+    if not complete:
+        print(f"::warning::{result.lookups_failed} service lookup(s) failed; leaving "
+              f"existing descriptions alone rather than asserting those services are gone")
     desired = {e.google_event_id(): entry_body(e, config, result.notices) for e in entries}
     # Side tables keyed the same way as `desired`, so the write passes can reason about an
     # entry's stylist and day without re-deriving them from the body.

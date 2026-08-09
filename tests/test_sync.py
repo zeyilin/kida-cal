@@ -587,6 +587,47 @@ def test_changeover_purge_is_sized_on_writes_that_landed():
     assert stats["blocked_delete"] == 240
 
 
+def test_changeover_purge_does_not_count_replacements_it_withheld():
+    """The two halves of the guard must cover the same population.
+
+    A blind stylist's replacements are popped out of `desired` by the symmetric-withholding
+    rule, so they are never inserted — and they never land in `failed_ids` either, because
+    no write was attempted. Sizing `live_now` from the full build therefore credited the
+    replacement set with openings that are not on the calendar, inflating the one guard
+    standing between a partial fetch and a changeover wipe by whatever share of the salon
+    the blind stylist owns.
+    """
+    cfg = mkconfig(event_style="blocks")
+    # 10 covered stylists whose availability collapsed to 1 opening each this run...
+    covered = [_event(stylist_id=f"s{i}", stylist=f"S{i}", days_ahead=3, hour=9)
+               for i in range(10)]
+    # ...against 60 legacy openings about to be retired.
+    legacy = _legacy_calendar([_event(stylist_id=f"s{i}", stylist=f"S{i}",
+                                      days_ahead=3, hour=9 + h)
+                               for i in range(10) for h in range(6)])
+    # A stylist we could not see completely, holding a stale CURRENT-style entry (so the
+    # withhold rule fires) and 30 openings this run (so the pop is worth 30 openings).
+    sick = [_event(stylist_id="sick", stylist="Sick", days_ahead=4 + d, hour=9 + h)
+            for d in range(5) for h in range(6)]
+    sick_stale = _existing_from(_event(stylist_id="sick", stylist="Sick",
+                                       days_ahead=12, hour=9), cfg)
+    svc = FakeCalendarService(events=legacy + [sick_stale])
+
+    stats = sync_calendar.sync(
+        cfg, _result(covered + sick, staff_ok={f"s{i}" for i in range(10)}), service=svc)
+
+    # Sick is blind: their stale entry is withheld and their replacements are not written.
+    assert stats["skipped_delete"] >= 1
+    assert stats["insert"] == 10
+    # 10 openings actually landed against 60 retiring — far under the blast-radius floor.
+    # Counting sick's 30 withheld openings would have carried it over and wiped the lot.
+    assert stats["migrated"] == 0
+    assert stats["blocked_delete"] == 60
+    # Nothing was removed: every legacy entry still stands, and so does sick's.
+    assert svc.methods("delete") == []
+    assert len([e for e in svc.live() if not e.startswith("kidav")]) == 60
+
+
 def test_unstamped_legacy_entries_stay_deletable():
     """An entry with no stylist stamp has UNKNOWN provenance, not 'not covered'. Treating
     unknown as protected would mean nothing written before the stamp existed could ever be

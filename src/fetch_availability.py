@@ -239,7 +239,19 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None) ->
 
     # One bootstrap to learn the live catalog (service names + staff mapping).
     probe = make_client(cache=cache, cache_ns="")
-    services, service_staff_ids = probe.bootstrap()
+    try:
+        services, service_staff_ids = probe.bootstrap()
+    except BudgetExhausted as e:
+        # Throttled before we could even read the catalog. There is no plan to walk, but
+        # this still has to look like every other untrusted fetch — a clean ok=False result
+        # the caller can artifact and exit 2 on — rather than a traceback that reports a
+        # throttle window as a crash. Other bootstrap failures stay loud: a missing obg or
+        # an unparseable catalog is a shape change, not a rate limit.
+        print(f"::error::fetch aborted during bootstrap: {e}", file=sys.stderr)
+        return FetchResult(slots=[], events=[], notices=None, ok=False,
+                           lookups_ok=0, lookups_failed=0, lookups_expected=0,
+                           requests_made=timely.BUDGET.made,
+                           errors=[f"run aborted: {e}"], staff_ok=set())
 
     for s in services:
         if s["service_id"] not in _KNOWN_IDS:
@@ -276,6 +288,12 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None) ->
     staff_seen: set[str] = set()      # stylists with at least one complete lookup
     staff_failed: set[str] = set()    # stylists with at least one failed lookup
 
+    # Set when a stop condition in src/timely.py (the per-endpoint throttle streak, the
+    # run-wide throttle total, or the request cap) ends the sweep mid-flight. Deliberately
+    # NOT folded into fail_count: the rest of the window was never looked at, so the only
+    # honest verdict for the whole run is untrusted, whatever the ratio of what we did see.
+    aborted: str | None = None
+
     for svc, eligible in plan:
         meta = service_meta(svc["service_id"])
         # Fresh session per service (service is baked into the obg session). Cache is
@@ -285,8 +303,12 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None) ->
             client.bootstrap()
             client.select_service(svc["bookable_item_id"], service_staff_ids)
             client.select_staff(eligible[0])
-        except BudgetExhausted:
-            raise                     # the run is over; never launder this into a count
+        except BudgetExhausted as e:
+            # The run is over. Never launder this into a per-lookup count — record it as
+            # an abort, which forces ok=False below regardless of how much we did fetch.
+            aborted = str(e)
+            errors.append(f"run aborted: {e}")
+            break
         except Exception as e:
             # One failure here costs us every staff lookup for this service, so charge
             # all of them. Charging 1 biased `ok` toward True exactly when the outage
@@ -374,8 +396,10 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None) ->
                             deposit_required=meta["deposit_required"],
                             book_url=config.booking_url,
                         ))
-            except BudgetExhausted:
-                raise
+            except BudgetExhausted as e:
+                aborted = str(e)
+                errors.append(f"run aborted: {e}")
+                break
             except Exception as e:
                 fail_count += 1
                 staff_failed.add(staff_id)
@@ -384,9 +408,13 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None) ->
             slots.extend(pair_slots)
             staff_seen.add(staff_id)
             ok_count += 1
+        if aborted:
+            break
 
     events = group_slots(slots)
-    notices = fetch_notices()
+    # An aborted run has nothing to describe and is mid-back-off; None is the "scrape
+    # failed" value, which leaves existing descriptions alone.
+    notices = None if aborted else fetch_notices()
 
     # "ok" == a large majority of the planned lookups actually landed AND we actually saw
     # data. The old rule (`ok_count > 0 and fail_count <= ok_count`) called a fetch healthy
@@ -396,13 +424,16 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None) ->
     # with genuinely zero openings across the whole window is not a state we should ever
     # publish silently, so require at least one slot before declaring health.
     ok = (expected > 0
+          and not aborted
           and ok_count >= MIN_LOOKUP_SUCCESS_RATIO * expected
           and memo_trusted
           and bool(slots))
+    if aborted:
+        print(f"::error::fetch aborted mid-sweep: {aborted}", file=sys.stderr)
     if not ok:
         print(f"::error::fetch incomplete: {ok_count}/{expected} lookups succeeded "
               f"(need {MIN_LOOKUP_SUCCESS_RATIO:.0%}), {len(slots)} slots, "
-              f"memo_trusted={memo_trusted}", file=sys.stderr)
+              f"memo_trusted={memo_trusted}, aborted={bool(aborted)}", file=sys.stderr)
 
     return FetchResult(slots=slots, events=events, notices=notices, ok=ok,
                        lookups_ok=ok_count, lookups_failed=fail_count,
@@ -410,8 +441,11 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None) ->
                        requests_saved=saved, errors=errors,
                        # Only stylists every one of whose lookups landed. A stylist with any
                        # failure is withheld from the delete pass rather than being read as
-                       # "no longer has openings".
-                       staff_ok=staff_seen - staff_failed)
+                       # "no longer has openings". An aborted run grants delete authority
+                       # over nobody: the stylists it never reached look identical to
+                       # stylists with no openings, and an empty set (unlike None) means
+                       # "nobody is covered" rather than "coverage unknown, all deletable".
+                       staff_ok=set() if aborted else staff_seen - staff_failed)
 
 
 if __name__ == "__main__":

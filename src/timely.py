@@ -15,9 +15,13 @@ from __future__ import annotations
 import base64
 import html as htmllib
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit
 
 import requests
 
@@ -37,10 +41,28 @@ MAX_RETRY_AFTER_SECONDS = 120
 # each costs little and is the polite response to being told to slow down.
 POST_EXTRA_DELAY_SECONDS = 3.0
 
-# Consecutive fully-throttled REQUESTS (each having already spent all 5 retries) across the
-# whole run that mean "we are not welcome right now". Must stay above the retry-loop length
-# so that a single stubborn url cannot end the sweep on its own.
+# Consecutive fully-throttled REQUESTS (each having already spent all 5 retries) that mean
+# "this endpoint does not want us right now". A single stubborn url cannot end the sweep on
+# its own because this counts whole REQUESTS, not the 5 attempts inside one — that, not the
+# constant's size, is what bounds one url's influence.
+#
+# Counted per (method, path), because Timely throttles ONE funnel step at a time while its
+# neighbours stay healthy, and every throttled step has a healthy sibling immediately before
+# it: bootstrap GET precedes /Booking/Service, /Booking/Service precedes
+# /Booking/StaffSelection, GetOpenDates precedes gettimeslots. A counter shared by those
+# siblings is reset to 0 by the sibling's success before the throttled step re-increments
+# it, so it oscillates 0->1->0->1 and never reaches the threshold. That is not theory: a
+# shared counter made this stop condition unreachable during the 2026-08-09 incident (16
+# services' /Booking/Service POSTs 429'd through every retry while all GETs succeeded, and
+# the run ground on for 12 minutes), and keying it per METHOD alone still left the same hole
+# open for a StaffSelection-only or gettimeslots-only window.
 MAX_CONSECUTIVE_THROTTLES = 3
+# ...and a monotonic backstop that no interleaving can reset. "Consecutive" has now been
+# defeated twice by call orders nobody predicted, so the per-endpoint streak above is the
+# fast trip and this total is the guarantee: it counts every fully-retried 429 of the run
+# and is never cleared by any success. Sized just above the per-endpoint threshold so a run
+# scattering single throttles across all four endpoints still stops promptly.
+MAX_THROTTLED_REQUESTS_PER_RUN = 5
 
 _OBG_RE = re.compile(r"/Booking/Service\?obg=([0-9a-f-]{36})")
 _SERVICE_RE = re.compile(
@@ -65,10 +87,58 @@ class TimelyError(RuntimeError):
 class BudgetExhausted(TimelyError):
     """The per-run request cap or the throttle stop-condition tripped.
 
-    This is NOT a per-lookup failure: it means the rest of the run's data is missing, so
-    callers must re-raise it past their per-lookup `except Exception` handlers instead of
-    laundering it into a failure count that still reports the fetch as healthy.
+    This is NOT a per-lookup failure: it means the rest of the run's data is missing, so it
+    must never be laundered into a failure count that still reports the fetch as healthy.
+    fetch_availability.fetch() catches it once, at the sweep level, and returns a result
+    explicitly marked untrusted (ok=False, delete authority over nobody) — which keeps every
+    downstream guard working and the fetch artifact written, rather than killing the process
+    with a traceback on what is now an expected outcome of a throttle window.
     """
+
+
+class _UnreadableRetryAfter(ValueError):
+    """Retry-After was present but is neither finite delta-seconds nor an HTTP-date."""
+
+
+def parse_retry_after(raw: str | None, *, now: datetime | None = None) -> float | None:
+    """Seconds to wait, from either RFC 7231 form. None when the header is absent or blank.
+
+    RFC 7231 permits `Retry-After: 120` *and* `Retry-After: Wed, 09 Aug 2026 14:30:00 GMT`.
+    Only the first was parsed, so a dated header fell back to the 2-second backoff — we
+    then retried five times inside 30 seconds while holding a note asking for 30 minutes,
+    and MAX_RETRY_AFTER_SECONDS could not fire no matter how distant the date. That breaks
+    the promise in docs/compliance.md that we never wait *less* than we were asked to.
+
+    Raises _UnreadableRetryAfter when the header is present but unparseable: an unreadable
+    back-off instruction is not permission to retry in two seconds.
+    """
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        pass
+    else:
+        # float() also accepts "inf" and "nan". NaN silently defeats every comparison that
+        # guards this value — `nan > MAX_RETRY_AFTER_SECONDS` is False and `max(2.0, nan)`
+        # returns 2.0 — so it must never reach the caller as a number.
+        if math.isfinite(v):
+            return max(0.0, v)      # a negative or past value means "retry now"
+        raise _UnreadableRetryAfter(s)
+    try:
+        when = parsedate_to_datetime(s)
+    except (TypeError, ValueError, OverflowError):
+        raise _UnreadableRetryAfter(s) from None
+    if when is None:                # older Pythons return None instead of raising
+        raise _UnreadableRetryAfter(s)
+    if when.tzinfo is None:
+        # A "-0000" offset parses naive, and subtracting naive from aware is a TypeError
+        # that would kill the run with a traceback. RFC 7231 dates are UTC.
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - (now or datetime.now(timezone.utc))).total_seconds())
 
 
 @dataclass
@@ -87,7 +157,9 @@ class _Budget:
         self.made = 0
         self.cap = 10_000
         self.delay = 1.0
-        self.throttles = 0        # consecutive 429s seen this run
+        # (method, path) -> consecutive fully-throttled requests for that endpoint.
+        self.throttles: dict[tuple[str, str], int] = {}
+        self.throttled_total = 0  # every fully-throttled request this run; never cleared
         self._last = 0.0
 
     def configure(self, cap: int, delay: float):
@@ -96,7 +168,19 @@ class _Budget:
         # Reset the counters too: a long-lived process (or a test calling fetch twice)
         # would otherwise inherit the previous run's spend and trip the cap immediately.
         self.made = 0
-        self.throttles = 0
+        self.throttles = {}
+        self.throttled_total = 0
+
+    @staticmethod
+    def _endpoint(method: str, url: str) -> tuple[str, str]:
+        """Identify the endpoint a throttle belongs to, ignoring the per-session `obg`.
+
+        Every funnel url carries a fresh `obg` query param, so keying on the full url would
+        give each service its own counter and no streak could ever build. The path alone is
+        stable across sessions. gettimeslots is the only path with a trailing slash, so it
+        is normalized rather than left to key differently from its siblings by accident.
+        """
+        return method.upper(), (urlsplit(url).path.rstrip("/").lower() or "/")
 
     def tick(self, extra_delay: float = 0.0):
         if self.made >= self.cap:
@@ -109,16 +193,27 @@ class _Budget:
         self._last = time.monotonic()
         self.made += 1
 
-    def throttled(self):
+    def throttled(self, method: str, url: str):
         """One fully-throttled REQUEST (all retries spent on 429s), not one attempt."""
-        self.throttles += 1
-        if self.throttles >= MAX_CONSECUTIVE_THROTTLES:
+        verb, path = self._endpoint(method, url)
+        n = self.throttles.get((verb, path), 0) + 1
+        self.throttles[(verb, path)] = n
+        self.throttled_total += 1
+        if n >= MAX_CONSECUTIVE_THROTTLES:
             raise BudgetExhausted(
-                f"{self.throttles} consecutive throttled requests from Timely — stopping "
+                f"{n} consecutive throttled {verb} {path} requests from Timely — stopping "
                 f"this run as the documented stop condition requires. Next run will retry.")
+        if self.throttled_total >= MAX_THROTTLED_REQUESTS_PER_RUN:
+            raise BudgetExhausted(
+                f"{self.throttled_total} fully-throttled requests this run (across "
+                f"{len([k for k, v in self.throttles.items() if v])} endpoints) — Timely is "
+                f"throttling us broadly enough that the streak counter never trips. "
+                f"Stopping; the next run will retry.")
 
-    def cleared(self):
-        self.throttles = 0
+    def cleared(self, method: str, url: str):
+        """A success only vouches for the endpoint it came from — see the note on
+        MAX_CONSECUTIVE_THROTTLES for why a sibling's success must not clear this."""
+        self.throttles[self._endpoint(method, url)] = 0
 
 
 BUDGET = _Budget()
@@ -237,13 +332,14 @@ class TimelyClient:
             BUDGET.tick(extra_delay)
             resp = self.session.request(method, url, data=data, headers=headers, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504):
-                retry_after = None
                 raw = resp.headers.get("Retry-After")
-                if raw:
-                    try:
-                        retry_after = float(raw)
-                    except ValueError:
-                        retry_after = None
+                try:
+                    retry_after = parse_retry_after(raw)
+                except _UnreadableRetryAfter:
+                    raise BudgetExhausted(
+                        f"{resp.status_code} from {url} with an unreadable Retry-After: "
+                        f"{raw!r}. Stopping rather than inventing a shorter wait than we "
+                        f"were asked for; the next run will retry.") from None
                 # An over-long Retry-After is a stop condition on ANY status that carries
                 # one, not just 429. A 503 with Retry-After: 3600 is what a Cloudflare
                 # overload/rate-limit page looks like, and clamping that down to 120s would
@@ -259,14 +355,14 @@ class TimelyClient:
                         # Count the exhausted REQUEST, not each attempt: incrementing per
                         # attempt made a single stubborn url trip the run-wide stop
                         # condition by itself, and made this branch unreachable for 429.
-                        BUDGET.throttled()
+                        BUDGET.throttled(method, url)
                     raise TimelyError(f"{resp.status_code} from {url} after retries")
                 wait = max(backoff, retry_after) if retry_after is not None else backoff
                 time.sleep(wait)
                 backoff *= 2
                 continue
             resp.raise_for_status()
-            BUDGET.cleared()
+            BUDGET.cleared(method, url)
             text = resp.text
             if cache_key and self.cache:
                 self.cache.put(cache_key, text)
@@ -286,8 +382,25 @@ class TimelyClient:
     def select_service(self, bookable_item_id: str, service_staff_ids: dict):
         form = {"LocationId": "0", "BookableTimeSlotItemIds": bookable_item_id, "commit": ""}
         form.update(service_staff_ids)
-        self._request("POST", f"{BASE}/Booking/Service?obg={self.obg}", data=form,
-                      extra_delay=POST_EXTRA_DELAY_SECONDS)
+        html = self._request("POST", f"{BASE}/Booking/Service?obg={self.obg}", data=form,
+                             extra_delay=POST_EXTRA_DELAY_SECONDS)
+        # A 200 does not prove the funnel moved. Under load the edge can serve an
+        # interstitial, or the session can reset to step 1 — and then GetOpenDates answers
+        # a well-formed, empty {"openDates": []} for every staff id. Each lookup "succeeds"
+        # with zero openings, those stylists keep full delete authority, and the sync
+        # removes genuinely bookable times. Every GET in this module has a fail-loudly
+        # shape guard; the two steps that actually mutate session state had none.
+        #
+        # Detected by what ONLY the service-selection page carries: its service checkboxes
+        # and the ServiceStaffIds hidden inputs we just echoed back. Captured against the
+        # live funnel 2026-08-09: both are absent once it advances. A link back to
+        # /Booking/Service?obg=... IS still present on the advanced page, so `_OBG_RE` must
+        # NOT be used here — it would fail every service on every run.
+        if _SERVICE_STAFF_RE.search(html) or _SERVICE_RE.search(html):
+            raise TimelyError(
+                "POST /Booking/Service came back on the service-selection page — the funnel "
+                "did not advance (session reset, or an edge interstitial). Refusing to read "
+                "availability from a session still parked at step 1.")
 
     def select_staff(self, staff_id: str):
         self._request("POST", f"{BASE}/Booking/StaffSelection?obg={self.obg}",

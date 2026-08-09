@@ -728,8 +728,15 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
         # changeover and wave through a blocks->slots one that had lost most of its data.
         # And counting entries we merely intended to write would let a run that failed 200
         # of its inserts still retire everything those inserts were meant to replace.
+        # ...and count only entries we actually TRIED to write. The symmetric withholding
+        # above pops a blind stylist's entries out of `desired`, so they are never inserted
+        # and never land in `failed_ids` either (no write was attempted, so nothing failed).
+        # Summing them here credited the replacement set with openings that are not on the
+        # calendar — inflating the one guard between a partial fetch and a changeover wipe
+        # by whatever share of the salon those stylists own (the busiest alone is ~15%).
         live_now = sum(e.opening_count for e in entries
-                       if e.google_event_id() not in failed_ids)
+                       if e.google_event_id() in desired
+                       and e.google_event_id() not in failed_ids)
         retiring = sum(_openings_of(obsolete[eid]) for eid in obsolete_in_window)
         landed_entries = stats["insert"] + stats["revive"] + stats["patch"] + stats["unchanged"]
         if not allow_mass_delete and live_now < DELETE_BLAST_RADIUS * retiring:

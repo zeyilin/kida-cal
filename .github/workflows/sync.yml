@@ -39,8 +39,11 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # Observed deep (90-day) sweeps take 82-85 min; near-term sweeps 13-14 min. 120 leaves
-    # headroom for a slow Timely day without letting a wedged run burn a full 6 hours.
+    # Observed deep (90-day) sweeps take ~38 min; near-term sweeps ~7 min (2026-08-09:
+    # 37m50s / 1,575 requests and 6m59s / 240 requests). The 82-85 min this comment used to
+    # quote was the pre-de-duplication figure and had been stale since that landed. The
+    # generous 120 stays: it is headroom for a slow Timely day, and the throttle stop
+    # conditions — not this timeout — are what end a run we are being rate-limited out of.
     timeout-minutes: 120
     permissions:
       contents: read

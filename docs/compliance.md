@@ -1,6 +1,7 @@
 # Compliance findings — Timely / KIDA NYC
 
-_Recorded during Phase 0 recon on 2026-07-17. Usage profile re-measured 2026-07-25._
+_Recorded during Phase 0 recon on 2026-07-17. Usage profile re-measured 2026-07-25; run
+cadence and the freshness gate described 2026-10-12._
 
 ## robots.txt
 
@@ -35,7 +36,9 @@ Disallow: /cdn-cgi/
   POSTs we do make (`/Booking/Service`, `/Booking/StaffSelection`) only move an
   anonymous session through the funnel; nothing is reserved or submitted.
 - **Low volume.** Sequential requests, ~1 req/sec (`request_delay_seconds`), honest
-  self-identifying User-Agent, exponential backoff on 429/5xx, hard per-run request cap.
+  self-identifying User-Agent, exponential backoff on 429/5xx, hard per-run request cap,
+  and at most one sweep per ~50 minutes however often the workflow is triggered, with
+  the few exceptions listed under "How often we look" below.
 - **No PII stored.** We persist availability (times), not people.
 
 ### Measured volume (not estimated)
@@ -55,8 +58,44 @@ Re-measured 2026-08-09, after the 3-second POST pacing landed: a deep sweep made
 requests in 37m50s** and a near-term run **240 requests in 6m59s**. Request counts scale
 with how much availability actually exists, so they drift below the figures above on a
 busy week; the wall clock is the stable number. Every run prints its own `requests_made`,
-so this table can be checked rather than trusted. Deep sweeps run roughly every 6 hours,
-not hourly.
+so this table can be checked rather than trusted. Deep sweeps run about every 6 hours
+(`deep_sweep_every_hours`), not on every run — but that is a target, not a ceiling. A deep
+sweep that does not complete cleanly (an untrusted fetch, a lost calendar write, a refused
+delete pass) is not recorded as one, so the next run that gets past the gate is normally
+deep again: while such a condition lasts, every run can be a ~38-minute deep sweep. A
+manual `full` dispatch is always deep.
+
+### How often we look: the freshness gate
+
+The sync workflow is scheduled four times an hour (`:08`, `:23`, `:38`, `:53`). That is not
+four sweeps an hour. GitHub delivers only a fraction of scheduled ticks — since late
+September 2026 about 4 a day, with a median gap of 5–6 hours — and the extra cron lines
+exist only to give a run more chances to be delivered at all. What bounds the load on
+Timely is a gate in the program itself:
+
+- Every run the workflow starts passes `--skip-if-checked-within 50`. Before sending
+  Timely anything it reads the calendar's status marker, and if the last run **started**
+  less than 50 minutes ago it exits without making a single Timely request.
+- The gate measures start-to-start, and a run records its start on the marker *before*
+  its first Timely request, so a run that fails, is throttled or times out still counts.
+  A burst of ticks after a throttled run cannot pile straight back onto Timely.
+- Net effect: at most one sweep per ~50 minutes however many ticks (or external
+  triggers, see the README) arrive, outside the exceptions below. With every tick on time
+  that works out to hourly. The ceiling is ~29 sweeps a day, against the 24 the old single
+  hourly cron line allowed in principle; in practice GitHub has been delivering about 4.
+
+The exceptions are known and rare:
+
+- A manual dispatch with depth `near` or `full` is a person asking for a run now, and is
+  not gated. Depth `auto` — which is what the README's external trigger sends — is.
+- A calendar with no status marker — a new setup, or one whose marker someone deleted —
+  has nothing to measure from, and keeps having nothing until a run gets far enough to
+  write one (past the fetch, to the calendar writes). The start is only ever recorded on
+  an existing marker, so until then every tick sweeps, including straight after a
+  throttled or failed run, and with no record of a deep sweep each one goes deep. If a new
+  setup's first runs are being throttled, disable the workflow until it is resolved.
+- Recording the start is best-effort: if that one calendar write fails, the run carries
+  on and the next tick is not skipped.
 
 **The response cache is a development aid only.** It cannot hit in CI (runners start
 clean, `.cache/` is gitignored, each key is requested once per run), so it was never a
@@ -78,7 +117,10 @@ These are enforced in code, not just documented — see `src/timely.py`:
 
 - `MAX_CONSECUTIVE_THROTTLES` (3): three consecutive *fully-retried* requests to the same
   endpoint — each having already spent all 5 attempts, so ~15 actual 429 responses — raise
-  `BudgetExhausted` and end the run. The next scheduled run retries; we do not grind.
+  `BudgetExhausted` and end the run. The next scheduled run retries — no sooner than 50
+  minutes after this one started, because a throttled run still counts toward the
+  freshness gate above (once the calendar has a status marker; see the exceptions there)
+  — so we do not grind.
 
   Counted per `(method, path)`, which matters more than it looks. Timely throttles one
   funnel step at a time while its neighbours stay healthy, and every step we make has a

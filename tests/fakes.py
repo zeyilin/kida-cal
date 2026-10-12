@@ -19,9 +19,30 @@ reason, so please keep the tombstone behaviour if you extend this.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import httplib2
 from googleapiclient.errors import HttpError
+
+
+def frozen_datetime(at: datetime) -> type:
+    """A `datetime` whose now() is pinned to `at`, for monkeypatching a module's
+    `datetime` name.
+
+    Patching the name the code under test looks up — rather than adding a clock seam to
+    it — freezes every clock read in that module, including ones a future edit adds, and
+    lets a regression test drive the OLD code at the same instant too. Everything except
+    now() is the real class (fromisoformat, combine, arithmetic, comparisons).
+    """
+    if at.tzinfo is None:
+        raise ValueError("freeze an aware datetime; the code under test is tz-aware")
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at.astimezone(tz) if tz is not None else at.replace(tzinfo=None)
+
+    return _Frozen
 
 
 def http_error(status: int, message: str, reason: str) -> HttpError:

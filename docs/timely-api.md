@@ -150,10 +150,20 @@ Either source works; the compact token is easiest and most stable to parse.
 
 ## Catalog (services)
 
-24 bookable services across 3 categories. `staff` = staff ids able to perform it.
+24 bookable services across 3 categories (as of 2026-07-17). `staff` = staff ids able to
+perform it.
+
 Prices below are from the service list; **note master-barber price can vary by
 staff** (each master barber shows their own price on the staff page — all currently
 $60 for a Haircut).
+
+> **Catalog drift, 2026-10-03.** A run warned about a service and a staff id that are in
+> neither table below: **Kids Hair Cut** (service `5319849`) — previously believed
+> phone-only and never seen in the online funnel — and staff id `709526`, not seen since.
+> Both are read off the live catalog every run, so nothing breaks: an id missing from
+> `src/catalog.py` is warned about on every run until it is added there; an unknown
+> service is still published, without a category or price, and an unknown staff member
+> is skipped rather than shown as "Staff 709526".
 
 ### Hair Salon (staff: Masa 287218, Satomi 367833, Nao 175308)
 
@@ -244,6 +254,10 @@ Example — haircut-only feed = 3 cut services (salon / master / junior) × thei
 - ≈ **~250 requests/run**. Hourly ⇒ ~6k/day. Comfortably under Apps Script's
   20k UrlFetch/day and trivial for GitHub Actions.
 
+(A Phase 0 estimate for a haircut-only feed. The deployed config is all services × all
+stylists × 90 days; its measured volume, and how often runs really happen, are in
+`docs/compliance.md`.)
+
 Optimizations: cache `GetOpenDates`, only fetch `gettimeslots` for days flagged
 available, and dedupe overlapping services by `(staff, start)` as the plan specifies.
 
@@ -266,12 +280,18 @@ Phase 0's job is to pick A/B/C. The deciding facts:
   `recon/capture.py` is already 90% of the fetcher.
 - OAuth token + calendar id live in **repo secrets**; keep the Free plan's $0 spend
   limit so nothing can ever bill.
-- Mitigate the 60-day scheduled-workflow auto-disable with real repository activity.
-  (Implemented as `.github/dependabot.yml`. A "keepalive empty commit" workflow was
-  tried first and is **not** recommended: it needs a PAT because commits made with the
-  built-in `GITHUB_TOKEN` do not reset the clock, and if that PAT is ever missing the
-  workflow reports success while doing nothing — which is exactly what happened here.
-  Dependabot needs no secret and produces reviewable PRs as a side effect.)
+- The 60-day scheduled-workflow auto-disable needs real repository activity, and no
+  automation here reliably provides it. A "keepalive empty commit" workflow was tried
+  first and is **not** recommended: it needs a PAT because commits made with the built-in
+  `GITHUB_TOKEN` do not reset the clock, and if that PAT is ever missing the workflow
+  reports success while doing nothing — which is exactly what happened here.
+  `.github/dependabot.yml` replaced it and was credited with the job, but by 2026-10 its
+  PRs had sat unmerged for up to 11 weeks, the pip ecosystem was at its open-PR limit and
+  opening nothing new, and github-actions (not at its limit) still opened the odd PR — its
+  newest was from 2026-09-07 — that sat unmerged like the rest. Whatever Dependabot
+  activity counts, there was little of it.
+  What actually covers this is *noticing*: the `KIDA_HEARTBEAT_URL` dead-man's switch in
+  `sync.yml`. A human commit — merging those PRs, say — is what resets the clock.
 
 ### Route A (Apps Script) — possible, but risk-flagged
 

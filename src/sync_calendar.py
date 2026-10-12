@@ -2,17 +2,46 @@
 Sync open slots into a dedicated Google Calendar (the live path).
 
 Idempotent: each calendar entry has a deterministic id derived from stylist + start, so an
-opening maps to the same calendar event across runs. Each sync computes a diff against the
-calendar and applies the minimum changes, in this order:
+opening maps to the same calendar event across runs. Each sync diffs the feed against the
+calendar and applies the minimum changes.
 
-  on calendar, not in feed    -> delete   (it got booked)
-  in feed and on calendar     -> patch if content changed
-  in feed, not on calendar    -> insert
-  wrong id scheme for the configured event_style -> delete (one-time changeover)
+Every entry of ours that the feed no longer contains ("stale") is first sorted into one of
+four kinds, because they need opposite orderings:
 
-Deletes run FIRST and deliberately so. They are the correctness-critical half: an event we
-fail to delete is a publicly advertised appointment that is already booked. Inserts merely
-delay good news. `stale` and `desired` are disjoint by construction, so the ordering is safe.
+  history   it has already ENDED                            delete in pass 1
+  held      its stylist was looked for and not seen          left alone, and so are
+            completely this run (see Safety)                 that stylist's writes
+  booked    nothing in the feed stands in for it             delete in pass 1
+  re-key    a BLOCK that a feed entry of the same stylist    delete in pass 4, and only
+            overlaps (blocks key on their first opening, so  once EVERY overlapping
+            booking or passing it re-keys the whole block)   replacement has landed
+
+Only a block can be a re-key. A `slots` id IS its opening (stylist + start), so nothing in
+the feed ever stands in for a stale slot — it is booked or history, even when an open
+neighbour on Timely's 30-minute grid overlaps its 55 minutes.
+
+An entry still in the feed under the same id is patched when its content changed. One kind
+of patch is held back like a re-key: a block keeps its id while its first opening stands,
+so a booking in its MIDDLE patches the head smaller and moves the tail into a new block.
+That patch retires part of the old span exactly as a re-key retires all of it ("narrowing").
+
+The passes then run in this order:
+
+  1. delete booked + history     nothing in the feed stands in for these, so no write can
+                                 make removing them safer; a booked entry left up is a
+                                 publicly advertised appointment that is already taken
+  2. patch                       in feed and on calendar, content changed (not narrowing)
+  3. insert                      in feed, not on calendar (409 -> revive, below)
+  4. narrowing patches, then     their availability IS still in the feed under another id;
+     delete re-keys              shrinking or removing them before that entry is live
+                                 would leave it advertised nowhere if its write failed, so
+                                 each waits for EVERY overlapping entry to land
+  5. changeover purge            entries written under the other event_style, entry by
+                                 entry under the same rule as 4, and refused outright if
+                                 the openings that landed are implausibly few
+
+Only pass 1 precedes the writes. Passes 4 and 5 retire things that something written in
+2-3 replaces, so a run that aborts part-way leaves the old entries standing.
 
 Why insert has a 409 fallback
 -----------------------------
@@ -30,10 +59,17 @@ Safety
 * We only ever touch our own secondary calendar, never the primary.
 * If the fetch did not clearly succeed (FetchResult.ok is False) we SKIP every delete, and
   main() refuses to write at all, so a transient Timely outage cannot wipe the calendar.
-* Even on a clean fetch, a delete pass that would remove more than half of the in-window
-  events is refused unless --allow-mass-delete is passed. The denominator is IN-WINDOW, not
-  whole-calendar: a 21-day run sees only ~350 of ~3300 events, so a whole-calendar
-  denominator would wave through a near-total wipe.
+* Delete authority is per stylist. One we LOOKED FOR and could not see completely
+  (in FetchResult.staff_planned but not staff_ok) is left exactly as they are: no delete,
+  no patch, no insert. One we never looked for (left the salon, dropped from Timely's
+  catalog, excluded by config) has nothing a failed lookup could have hidden, so their
+  entries are ordinary stale entries.
+* Staleness is judged against the window the FETCH used (FetchResult.window_start), never
+  one recomputed from this process's clock, which may have crossed midnight since.
+* Even on a clean fetch, a delete pass that would remove more than half of the upcoming
+  in-window events is refused unless --allow-mass-delete is passed. The denominator is
+  IN-WINDOW, not whole-calendar: a 21-day run sees only ~350 of ~3300 events, so a
+  whole-calendar denominator would wave through a near-total wipe.
 * Individual write failures are isolated and counted; one bad event no longer aborts the run.
   Auth/permission failures still abort immediately rather than retrying thousands of times.
 
@@ -52,7 +88,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -123,6 +159,22 @@ _QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded"}
 
 def _is_rate_limited(exc) -> bool:
     return bool(_reasons(exc) & _RATE_REASONS)
+
+
+def _fatal_write_error(exc, what: str) -> str | None:
+    """Why no write to this calendar can succeed right now, or None if `exc` is survivable.
+
+    One classification for every write, so the marker stamp — the run's first write — and
+    the sync's own writes cannot disagree about whether a 403 is worth carrying on past.
+    """
+    status = _status(exc)
+    if status == 403 and _reasons(exc) & _QUOTA_REASONS:
+        return (f"{what}: Google Calendar quota exhausted ({sorted(_reasons(exc))}). "
+                f"Aborting; the quota resets on Google's schedule and the next run retries.")
+    if status in (401, 403) and not _is_rate_limited(exc):
+        return (f"{what}: {status} {sorted(_reasons(exc)) or exc}. Aborting rather than "
+                f"repeating this for every remaining event — check calendar sharing/scopes.")
+    return None
 
 
 def _stylist_of(item: dict) -> str | None:
@@ -288,13 +340,13 @@ def _scheme(event_id: str) -> str:
     return "blocks" if event_id.startswith(BLOCK_PREFIX) else "slots"
 
 
-def _parse_start(item: dict, tz) -> datetime | None:
-    """Start instant of an existing calendar event, or None if unparseable.
+def _parse_when(item: dict, key: str, tz) -> datetime | None:
+    """The `start` or `end` instant of an existing calendar event, or None if unparseable.
 
     Guards TypeError as well as ValueError: comparing a naive datetime against an aware
     horizon raises TypeError, which would otherwise kill the whole delete phase.
     """
-    s = item.get("start") or {}
+    s = item.get(key) or {}
     raw = s.get("dateTime") or s.get("date")
     if not raw:
         return None
@@ -305,6 +357,27 @@ def _parse_start(item: dict, tz) -> datetime | None:
     if d.tzinfo is None:          # all-day ("date") or an unexpected naive value
         d = d.replace(tzinfo=tz)  # assume salon-local
     return d
+
+
+def _parse_start(item: dict, tz) -> datetime | None:
+    return _parse_when(item, "start", tz)
+
+
+def _parse_end(item: dict, tz) -> datetime | None:
+    return _parse_when(item, "end", tz)
+
+
+def _overlaps(start: datetime, end: datetime, other_start: datetime,
+              other_end: datetime) -> bool:
+    """Whether [start, end) and [other_start, other_end) share any instant.
+
+    A legacy item with no parsable end is given end == start, and a zero-length span can
+    never pass the half-open test — so it is treated as the single instant `start` instead,
+    or such an item could never be recognised as superseded by the entry that replaces it.
+    """
+    if end <= start:
+        return other_start <= start < other_end
+    return other_start < end and start < other_end
 
 
 def _list_all(service, cal_id: str):
@@ -324,19 +397,32 @@ def _list_all(service, cal_id: str):
 
 # ---------------------------------------------------------------- status marker
 def read_marker(service, cal_id: str) -> dict | None:
+    """The status marker, or None if there is none.
+
+    events.get returns a soft-deleted event (status="cancelled") rather than a 404, so a
+    marker someone deleted by hand would otherwise keep answering for the last deep sweep
+    and the last run start — the opposite of what deleting it was meant to do.
+    """
     from googleapiclient.errors import HttpError
     try:
-        return _execute(service.events().get(calendarId=cal_id, eventId=MARKER_ID))
+        marker = _execute(service.events().get(calendarId=cal_id, eventId=MARKER_ID))
     except HttpError as e:
         if _status(e) in (404, 410):
             return None
         raise
-
-
-def marker_last_deep_sweep(marker: dict | None) -> datetime | None:
-    if not marker:
+    if not marker or marker.get("status") == "cancelled":
         return None
-    raw = ((marker.get("extendedProperties") or {}).get("private") or {}).get("last_deep_sweep")
+    return marker
+
+
+def _marker_private(marker: dict | None) -> dict:
+    return ((marker or {}).get("extendedProperties") or {}).get("private") or {}
+
+
+def _marker_time(marker: dict | None, key: str) -> datetime | None:
+    """A timestamp stored on the marker, or None if absent or unreadable. Unreadable is
+    deliberately the same as absent: corrupt state must never read as 'just happened'."""
+    raw = _marker_private(marker).get(key)
     if not raw:
         return None
     try:
@@ -345,21 +431,94 @@ def marker_last_deep_sweep(marker: dict | None) -> datetime | None:
         return None
 
 
+def _elapsed(since: datetime | None, now: datetime) -> timedelta | None:
+    if since is None:
+        return None
+    if since.tzinfo is None:       # hand-edited marker; assume the clock it was compared to
+        since = since.replace(tzinfo=now.tzinfo)
+    return now - since
+
+
+def marker_last_deep_sweep(marker: dict | None) -> datetime | None:
+    return _marker_time(marker, "last_deep_sweep")
+
+
+def marker_last_attempt(marker: dict | None) -> datetime | None:
+    """When the last non-skipped run STARTED. Markers written before last_attempt existed
+    only carry last_run (when a run finished), which is the closest thing they have."""
+    return _marker_time(marker, "last_attempt") or _marker_time(marker, "last_run")
+
+
+def stamp_last_attempt(service, cal_id: str, marker: dict, at: datetime) -> None:
+    """Record on the existing marker that a run started, before it sends Timely anything.
+
+    Stamped at the START rather than with the rest of the marker at the end, so a run that
+    dies part-way — an untrusted fetch, a throttle abort, the job timeout — still counts as
+    an attempt: the skip gate exists precisely so the next tick does not pile straight back
+    onto Timely after one of those. The whole private map is sent back with the one key
+    changed, so nothing else on the marker (last_run, last_deep_sweep) is lost whether
+    Google merges the map or replaces it.
+
+    This is also the run's first WRITE, and preflight only proved a read. A refusal that
+    every later write would hit too — a calendar shared read-only, an exhausted quota —
+    raises WriteAborted here, before Timely is sent anything. Carrying on instead spent a
+    full sweep on a run bound to fail, and because nothing was stamped the gate never
+    skipped the next tick either: a sweep per tick for as long as the refusal lasted.
+    Anything transient (429, 5xx, a rate-limit 403) only warns: the sync's own writes may
+    well get through, and all that is lost is one tick's skip.
+    """
+    from googleapiclient.errors import HttpError
+    private = dict(_marker_private(marker), last_attempt=at.isoformat())
+    try:
+        _execute(service.events().patch(calendarId=cal_id, eventId=MARKER_ID,
+                                        body={"extendedProperties": {"private": private}}))
+    except HttpError as e:
+        fatal = _fatal_write_error(e, "stamping last_attempt on the status marker")
+        if fatal:
+            raise WriteAborted(fatal) from e
+        print(f"::warning::could not stamp last_attempt on the status marker "
+              f"({_status(e)} {sorted(_reasons(e)) or ''}); continuing — at worst the next "
+              f"tick is not skipped")
+
+
 def write_marker(service, cal_id: str, *, checked_at: datetime, entry_count: int,
-                 last_deep: datetime | None, dry_run: bool = False) -> None:
+                 last_deep: datetime | None, last_attempt: datetime | None = None,
+                 succeeded: bool = True, previous_success: datetime | None = None,
+                 dry_run: bool = False) -> None:
     """Publish an all-day 'last checked' event.
 
     Without this the calendar looks equally healthy whether it was synced 5 minutes or 5 days
-    ago — which is exactly how a 3-day outage went unnoticed. One patch per run; never stamp
-    a timestamp into per-event descriptions, which would rewrite the whole calendar hourly.
+    ago — which is exactly how a 3-day outage went unnoticed. Two small marker writes per
+    run (main()'s start stamp, then this); never stamp a timestamp into per-event
+    descriptions, which would rewrite the whole calendar hourly.
+
+    `entry_count` is OPENINGS, despite the name, so the title reads the same under either
+    event_style.
+
+    last_run is the last SUCCESSFUL sync — a run main() is about to exit 0 from. The
+    workflow opens an issue off its age and pings the heartbeat on a skipped tick only
+    while it is fresh, so a run that will exit 1 passes succeeded=False and the previous
+    value is carried forward. Stamping it on every run made a persistent failure read as
+    an hour old forever: no issue, and the skipped ticks behind each failure fed the
+    dead-man's switch.
     """
     from googleapiclient.errors import HttpError
 
+    if last_deep is not None and last_deep.tzinfo is None:
+        # A hand-edited marker. _elapsed() already reads it as salon-local; subtracting it
+        # from the aware checked_at raised TypeError after every calendar write, on every
+        # run, until a deep sweep replaced it. Written back aware.
+        last_deep = last_deep.replace(tzinfo=checked_at.tzinfo)
+    last_run = checked_at if succeeded else previous_success
     day = checked_at.date()
     age_note = ""
     if last_deep:
         hours = (checked_at - last_deep).total_seconds() / 3600
         age_note = f"Last full 90-day sweep: {hours:.0f}h ago.\n"
+    if not succeeded:
+        age_note += ("This run did not finish cleanly; the last clean sync was "
+                     + (f"at {last_run:%Y-%m-%d %-I:%M %p %Z}.\n" if last_run else
+                        "not recorded.\n"))
     body = {
         "id": MARKER_ID,
         "summary": f"✓ KIDA slots checked {checked_at:%-I:%M %p} · {entry_count} open",
@@ -376,10 +535,17 @@ def write_marker(service, cal_id: str, *, checked_at: datetime, entry_count: int
         # meant a `--depth near` dispatch against a marker-less calendar would claim a full
         # sweep had just happened, suppressing the real one for deep_sweep_every_hours.
         # An absent key keeps meaning "unknown", which resolve_depth already reads as
-        # "go deep". last_run separately records that the run happened at all.
+        # "go deep". last_run, the same way, is only ever a success we know of (above).
+        #
+        # This body REPLACES the marker, so last_attempt must be written back or the stamp
+        # main() put there at the start of this run is erased. It is the run's START, not
+        # checked_at: the skip gate measures start-to-start, and recording the finish would
+        # push every later window back by however long this run took — a 38-minute deep
+        # sweep would make the next on-time tick, 22 minutes after it ended, look too soon.
         "extendedProperties": {"private": dict(
-            {"last_run": checked_at.isoformat()},
-            **({"last_deep_sweep": last_deep.isoformat()} if last_deep else {}))},
+            **({"last_run": last_run.isoformat()} if last_run else {}),
+            **({"last_deep_sweep": last_deep.isoformat()} if last_deep else {}),
+            **({"last_attempt": last_attempt.isoformat()} if last_attempt else {}))},
     }
     if dry_run:
         return
@@ -391,7 +557,8 @@ def write_marker(service, cal_id: str, *, checked_at: datetime, entry_count: int
         _execute(service.events().update(calendarId=cal_id, eventId=MARKER_ID, body=body))
 
 
-def resolve_depth(service, cal_id: str, config: Config, requested: str) -> tuple[int, bool]:
+def resolve_depth(config: Config, requested: str, marker: dict | None,
+                  now: datetime | None = None) -> tuple[int, bool]:
     """Return (lookahead_days, is_deep_sweep).
 
     'auto' decides from *elapsed time since the last deep sweep*, read off the marker event,
@@ -399,17 +566,18 @@ def resolve_depth(service, cal_id: str, config: Config, requested: str) -> tuple
     over one measured 180-hour window GitHub delivered 56% of hourly ticks, 00 UTC never fired
     once, and deep sweeps landed 14 times against 30 intended. An elapsed-time check is immune
     to dropped ticks, cron drift, and a long run pushing the next one past its hour.
+
+    Takes the marker main() already read rather than fetching its own: the skip gate, this
+    decision and the final deep-sweep stamp must all judge the SAME copy.
     """
     if requested == "near":
         return config.near_lookahead_days, False
     if requested == "full":
         return config.lookahead_days, True
 
-    last_deep = marker_last_deep_sweep(read_marker(service, cal_id)) if service else None
-    if last_deep is None:
-        return config.lookahead_days, True
-    now = datetime.now(last_deep.tzinfo or ZoneInfo(config.timezone))
-    if now - last_deep >= timedelta(hours=config.deep_sweep_every_hours):
+    since = _elapsed(marker_last_deep_sweep(marker),
+                     now or datetime.now(ZoneInfo(config.timezone)))
+    if since is None or since >= timedelta(hours=config.deep_sweep_every_hours):
         return config.lookahead_days, True
     return config.near_lookahead_days, False
 
@@ -437,18 +605,24 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
               f"existing descriptions alone rather than asserting those services are gone")
     desired = {e.google_event_id(): entry_body(e, config, result.notices) for e in entries}
     # Side tables keyed the same way as `desired`, so the write passes can reason about an
-    # entry's stylist and day without re-deriving them from the body.
+    # entry's stylist, size and time span without re-deriving them from the body.
     _entry_stylist = {e.google_event_id(): str(e.stylist_id) for e in entries}
-    _entry_day = {e.google_event_id(): (str(e.stylist_id), e.start.date()) for e in entries}
-    _desired_days = set(_entry_day.values())
+    _entry_openings = {e.google_event_id(): e.opening_count for e in entries}
+    _spans: dict[str, list[tuple[datetime, datetime, str]]] = {}
+    for e in entries:
+        _spans.setdefault(str(e.stylist_id), []).append((e.start, e.end, e.google_event_id()))
 
     stats = {"insert": 0, "revive": 0, "patch": 0, "delete": 0, "migrated": 0,
              "unchanged": 0, "skipped_delete": 0, "blocked_delete": 0,
-             "failed_insert": 0, "failed_patch": 0, "failed_delete": 0}
+             "failed_insert": 0, "failed_patch": 0, "failed_delete": 0,
+             # Not a write counter: openings across EVERYTHING of ours still live on the
+             # calendar once this run is done, which is what the status marker reports.
+             "live_openings": 0}
 
     if dry_run and service is None:
         # No API access: just report what we'd publish.
         stats["insert"] = len(desired)
+        stats["live_openings"] = sum(_entry_openings.values())
         print(f"[dry-run] would publish {len(desired)} entries "
               f"(no calendar access to diff against)")
         for e in entries[:10]:
@@ -470,96 +644,186 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
             continue
         (existing if _scheme(eid) == config.event_style else obsolete)[eid] = item
 
-    # The horizon is the END of the last day the fetch covered. fetch() filters by DATE
-    # (day_date > horizon), so a datetime horizon would leave later-in-the-day slots on the
-    # final day permanently undeletable: absent from `desired`, but past the cutoff.
-    last_day = (datetime.now(tz) + timedelta(days=config.lookahead_days)).date()
-    horizon = datetime.combine(last_day + timedelta(days=1), dtime.min, tzinfo=tz)
     now = datetime.now(tz)
+
+    # The horizon is the END of the last day the FETCH covered, measured from the day the
+    # fetch called "today" — not from this clock. A near run whose fetch starts at 23:50
+    # and whose sync runs at 00:10 otherwise reaches one day further than anything it
+    # looked at, and deletes that whole unfetched day as "no longer offered". And it is a
+    # date boundary, not a datetime: fetch() filters by DATE (day_date > horizon), so a
+    # datetime horizon would leave later-in-the-day slots on the final day permanently
+    # undeletable — absent from `desired`, but past the cutoff.
+    window_start: date | None = result.window_start
+    if window_start is None:
+        window_start = now.date()
+        print(f"::warning::fetch result does not say which day its window started (a "
+              f"capture from before window_start was recorded); assuming {window_start}. "
+              f"If the fetch began before midnight, entries on the day after its window "
+              f"will be judged stale.")
+    last_day = window_start + timedelta(days=config.lookahead_days)
+    horizon = datetime.combine(last_day + timedelta(days=1), dtime.min, tzinfo=tz)
 
     starts = {eid: _parse_start(item, tz) for eid, item in existing.items()}
     obs_starts = {eid: _parse_start(item, tz) for eid, item in obsolete.items()}
+    # An entry's END is what makes it history. A legacy item with no parsable end is given
+    # its start, i.e. it becomes history the moment it begins — which is how every entry
+    # was treated before ends were consulted at all.
+    ends = {eid: _parse_end(item, tz) or starts[eid] for eid, item in existing.items()}
+    obs_ends = {eid: _parse_end(item, tz) or obs_starts[eid]
+                for eid, item in obsolete.items()}
 
     # Deletes are window-scoped so a short near-term run can't wipe the deep run's far-out
     # events. That applies to the obsolete bucket too: a near-tier run that meets a style
     # changeover must not purge 90 days of entries it can only replace 21 days of.
-    in_window = [eid for eid, d in starts.items() if d is not None and d <= horizon]
+    # Strictly before: `horizon` is the first instant of the first day the fetch did NOT
+    # cover, so an entry starting exactly then was never looked for.
+    in_window = [eid for eid, d in starts.items() if d is not None and d < horizon]
     obsolete_in_window = [eid for eid, d in obs_starts.items()
-                          if d is not None and d <= horizon]
-
-    # Events that have already started can never be in `desired` (fetch drops past slots),
-    # so they are unconditionally stale for reasons that say nothing about fetch health.
-    # Keeping them out of the ratio stops routine pruning from tripping the guard.
-    # `not in desired` applies to the past bucket too. A slot that merely STARTED while the
-    # fetch was running is still in `desired` (the fetch saw it minutes ago), and deleting
-    # it would remove an entry the same run is about to write — churn on every run, and
-    # under `blocks` it can retire a block whose later openings are still bookable.
-    past = [eid for eid in in_window if starts[eid] < now and eid not in desired]
-    future_stale = [eid for eid in in_window
-                    if eid not in desired and starts[eid] >= now]
-    future_in_window = [eid for eid in in_window if starts[eid] >= now]
+                          if d is not None and d < horizon]
 
     # Delete authority is per stylist where we can establish it. An event we wrote carries
     # its stylist id, so if that person's lookups failed this run we simply leave their
     # entries alone rather than deleting on information we know is incomplete. Without this
     # a single flaky stylist (the busiest owns 9 of 60 lookups = 15%, inside the 20% slack
     # that still reports ok=True) would be wiped off the public calendar.
-    staff_covered = result.staff_ok
+    staff_ok, staff_planned = result.staff_ok, result.staff_planned
 
-    def _may_delete(item: dict) -> bool:
-        """True unless the item belongs to a stylist we could not see completely.
+    def _uncovered(who: str | None) -> bool:
+        """True for a stylist we LOOKED FOR this run and could not see completely.
+
+        Absence from staff_ok alone is not that. staff_ok can only ever contain stylists
+        the fetch planned a lookup for, so someone who left the salon, was dropped from
+        Timely's catalog, or is excluded by config.stylists is never in it — and reading
+        that as "failed" held their entries forever, with skipped_delete over the exit
+        floor failing every hourly run for the 90 days it took them to age out. Only when
+        the plan is unknown (a capture from before staff_planned existed) do we fall back
+        to the old, stricter rule.
 
         An unstamped item (written by an older version) reports None, which means UNKNOWN
         provenance, not "not covered" — it must stay deletable or nothing written before
         the stamp existed could ever be pruned.
         """
-        if staff_covered is None:
-            return True
-        who = _stylist_of(item)
-        return who is None or who in staff_covered
+        if staff_ok is None or who is None:
+            return False
+        if staff_planned is not None:
+            return who in staff_planned and who not in staff_ok
+        return who not in staff_ok
 
-    if staff_covered is not None:
-        held = {eid for eid in future_stale if not _may_delete(existing[eid])}
-        if held:
-            print(f"::warning::withholding {len(held)} delete(s) for stylists whose "
-                  f"lookups failed this run; they keep their entries until we can see them")
-            stats["skipped_delete"] += len(held)
-            future_stale = [e for e in future_stale if e not in held]
-        # Withholding must be SYMMETRIC. Suppressing a stylist's deletes while still
-        # inserting their new entries publishes two overlapping blocks for the same
-        # stylist-day, the older one still advertising an opening we know is booked.
-        # If we cannot see someone completely, we leave their whole day alone.
-        blind = {who for who in
-                 {_stylist_of(existing[eid]) for eid in held} if who is not None}
-        if blind:
-            dropped = [eid for eid, b in desired.items()
-                       if str(_entry_stylist[eid]) in blind]
-            if dropped:
-                print(f"::warning::also withholding {len(dropped)} write(s) for those "
-                      f"stylists, so their day is not double-published")
-                for eid in dropped:
-                    desired.pop(eid, None)
-        # The changeover purge needs the SAME authority. It is the one delete path that
-        # runs when `existing` is empty by construction, so the check above cannot fire
-        # for it — and a changeover is exactly when a half-seen stylist would otherwise be
-        # erased with no replacement written.
-        held_obs = [eid for eid in obsolete_in_window if not _may_delete(obsolete[eid])]
-        if held_obs:
-            print(f"::warning::withholding {len(held_obs)} changeover retirement(s) for "
-                  f"stylists whose lookups failed this run")
-            stats["skipped_delete"] += len(held_obs)
-            hold = set(held_obs)
-            obsolete_in_window = [e for e in obsolete_in_window if e not in hold]
+    # Sort every stale in-window entry into its kind (the module docstring has the table).
+    # `wanted` is the feed BEFORE any withholding below: an uncovered stylist's unchanged
+    # entry is not stale just because we decline to touch it.
+    wanted = set(desired)
+    history: list[str] = []
+    held: list[str] = []
+    booked: list[str] = []
+    rekeyed: dict[str, list[str]] = {}     # stale id -> every desired id that overlaps it
+    for eid in in_window:
+        if eid in wanted:
+            continue
+        if ends[eid] < now:
+            # Over. Nothing the fetch did or did not see can make it bookable again, so it
+            # is deletable whoever it belongs to.
+            history.append(eid)
+            continue
+        who = _stylist_of(existing[eid])
+        # From here on, an entry that has STARTED is treated exactly like a future one.
+        # Under `blocks` an in-progress block can still hold bookable openings (10:00-14:55
+        # at 11:30 still offers 12:00 onward), and exempting it from authority and re-key
+        # handling deleted a half-seen stylist's day with nothing written in its place.
+        if _uncovered(who):
+            held.append(eid)
+            continue
+        # Only a block is ever re-keyed. A slot's id is sha1(stylist|start) — the opening
+        # itself — so nothing in the feed stands in for a stale one. On Timely's 30-minute
+        # grid of 55-minute services an open neighbour overlaps a booked slot, and calling
+        # that a re-key deferred the delete behind every insert, then kept an appointment
+        # already taken advertised whenever the neighbour's own, unrelated write failed.
+        over = ([k for s, e, k in _spans.get(who, ())
+                 if _overlaps(starts[eid], ends[eid], s, e)]
+                if who is not None and _scheme(eid) == "blocks" else [])
+        if over:
+            rekeyed[eid] = over
+        else:
+            booked.append(eid)
 
-    stale = past + future_stale
+    # Withholding must be SYMMETRIC. Suppressing a stylist's deletes while still writing
+    # their new entries publishes two overlapping blocks for the same stylist-day, the
+    # older one still advertising an opening we know is booked — and PATCHING one of their
+    # existing entries rewrites it from data we know is partial (a block keeps its id while
+    # its first opening stands, so it shrinks to whatever this run saw, then grows back next
+    # run). If we cannot see someone completely, we leave their whole day alone.
+    blind_writes = [eid for eid in desired if _uncovered(_entry_stylist[eid])]
+    withheld_writes = sum(1 for eid in blind_writes
+                          if eid not in existing
+                          or _needs_patch(existing[eid], desired[eid], compare_description))
+    for eid in blind_writes:
+        desired.pop(eid)
+    # The changeover purge needs the SAME authority. It is the one delete path that runs
+    # when `existing` is empty by construction, so the classification above cannot reach
+    # it — and a changeover is exactly when a half-seen stylist would otherwise be erased
+    # with no replacement written. History is exempt here too: it is over either way.
+    held_obs = {eid for eid in obsolete_in_window
+                if obs_ends[eid] >= now and _uncovered(_stylist_of(obsolete[eid]))}
+    obsolete_in_window = [e for e in obsolete_in_window if e not in held_obs]
+    # ...and the same per-ENTRY rule as a re-key. An obsolete entry that a feed entry of
+    # the same stylist overlaps is that entry's predecessor in the other style, and may go
+    # only once every one of them landed. The purge's own guard is an aggregate over the
+    # whole calendar, so on its own it let one stylist's failed block be paid for by
+    # everyone else's: the rest of the salon cleared the bar, and that stylist's
+    # still-bookable openings were retired with nothing in their place. Unlike a stale
+    # slot, an obsolete entry IS replaceable even when it is a slot: its successor is
+    # written under the other style's id (the block a slot's opening now sits in, or the
+    # slots a block breaks into).
+    obs_rekeyed: dict[str, list[str]] = {}
+    for eid in obsolete_in_window:
+        who = _stylist_of(obsolete[eid])
+        if who is None or obs_ends[eid] < now:
+            continue                       # unknown provenance, or history: deletable
+        over = [k for s, e, k in _spans.get(who, ())
+                if _overlaps(obs_starts[eid], obs_ends[eid], s, e)]
+        if over:
+            obs_rekeyed[eid] = over
+    if held or held_obs or withheld_writes:
+        blind = sorted({_entry_stylist[eid] for eid in blind_writes}
+                       | {_stylist_of(existing[eid]) for eid in held}
+                       | {_stylist_of(obsolete[eid]) for eid in held_obs})
+        print(f"::warning::{len(blind)} stylist(s) could not be seen completely this run "
+              f"({', '.join(blind)}); leaving them exactly as they are: withholding "
+              f"{len(held) + len(held_obs)} delete(s) and {withheld_writes} write(s)")
+    stats["skipped_delete"] += len(held) + len(held_obs)
+
+    # Narrowing patches: an entry the feed still has under the same id, whose STORED span
+    # other feed entries of the same stylist now share. A block keeps its id while its
+    # first opening stands, so a booking mid-block patches the head smaller and moves the
+    # tail into a new block — and patching first meant one failed tail insert (or a quota
+    # abort before it) left the tail's openings advertised nowhere, with the old block
+    # never stale for the re-key rule to protect. Feed blocks of one stylist never overlap
+    # each other, so a shared stored span is exactly a span this patch would give away.
+    # Blocks only, for the reason above: a slot's span is its own opening's.
+    narrowing: dict[str, list[str]] = {}   # existing id -> desired ids taking over its span
+    for eid, body in desired.items():
+        item = existing.get(eid)
+        if (item is None or _scheme(eid) != "blocks" or starts[eid] is None
+                or not _needs_patch(item, body, compare_description)):
+            continue
+        others = [k for s, e, k in _spans.get(_entry_stylist[eid], ())
+                  if k != eid and _overlaps(starts[eid], ends[eid], s, e)]
+        if others:
+            narrowing[eid] = others
 
     # ---- guards on the delete pass ----
+    # The blast-radius ratio is over UPCOMING entries only. Anything that has already
+    # started is stale for reasons that say nothing about fetch health — fetch() drops
+    # started slots, and a block re-keys as its openings pass — so counting it would let
+    # routine pruning trip the guard.
+    upcoming = [eid for eid in in_window if starts[eid] >= now]
+    upcoming_stale = [eid for eid in booked + list(rekeyed) if starts[eid] >= now]
     blocked = False
     if not result.ok:
-        stats["skipped_delete"] += len(stale) + len(obsolete_in_window)
+        n = len(booked) + len(history) + len(rekeyed) + len(obsolete_in_window)
+        stats["skipped_delete"] += n
         print(f"WARNING: fetch not ok (ok={result.lookups_ok} failed={result.lookups_failed}); "
-              f"skipping {len(stale) + len(obsolete_in_window)} deletes to avoid wiping "
-              f"the calendar")
+              f"skipping {n} deletes to avoid wiping the calendar")
         blocked = True
     # Size the floor in OPENINGS, not entries. Under `blocks` the 21-day window is ~97
     # entries but ~303 openings, so an entry floor of 50 sits only 1.9x away — and
@@ -567,35 +831,28 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     # the floor, silently disabling the guard entirely on exactly the calendars where a
     # wipe is least recoverable.
     elif (not allow_mass_delete
-            and sum(_openings_of(existing[e]) for e in future_in_window) >= DELETE_BLAST_MIN
-            and len(future_stale) > DELETE_BLAST_RADIUS * len(future_in_window)):
-        stats["blocked_delete"] = len(future_stale)
-        print(f"::error::refusing to delete {len(future_stale)} of {len(future_in_window)} "
+            and sum(_openings_of(existing[e]) for e in upcoming) >= DELETE_BLAST_MIN
+            and len(upcoming_stale) > DELETE_BLAST_RADIUS * len(upcoming)):
+        stats["blocked_delete"] = len(upcoming_stale)
+        print(f"::error::refusing to delete {len(upcoming_stale)} of {len(upcoming)} "
               f"upcoming in-window events (> {DELETE_BLAST_RADIUS:.0%}). Fetch reported ok "
               f"but looks partial. Re-run with --allow-mass-delete if this really is correct.")
         blocked = True
 
     failures: list[str] = []
-    failed_ids: set[str] = set()      # entries whose write did NOT land this run
+    landed: set[str] = set()     # desired ids that are on the calendar as written this run
+    gone: set[str] = set()       # ids this run removed (or found already removed)
     consecutive = 0
 
     def guard(exc, kind: str, eid: str) -> None:
         """Record a per-item write failure, or abort if it is not survivable."""
         nonlocal consecutive
         status = _status(exc)
-        if status == 403 and _reasons(exc) & _QUOTA_REASONS:
-            raise WriteAborted(
-                f"{kind} {eid}: Google Calendar quota exhausted ({sorted(_reasons(exc))}). "
-                f"Aborting; the quota resets on Google's schedule and the next run retries.")
-        if status in (401, 403) and not _is_rate_limited(exc):
-            raise WriteAborted(
-                f"{kind} {eid}: {status} {sorted(_reasons(exc)) or exc}. Aborting rather than "
-                f"repeating this for every remaining event — check calendar sharing/scopes.")
+        fatal = _fatal_write_error(exc, f"{kind} {eid}")
+        if fatal:
+            raise WriteAborted(fatal)
         stats[f"failed_{kind}"] += 1
         failures.append(f"{kind} {eid}: {status} {sorted(_reasons(exc)) or ''}".strip())
-        if kind in ("insert", "patch"):
-            # This entry is not live, so it cannot justify retiring anything it replaces.
-            failed_ids.add(eid)
         consecutive += 1
         if consecutive >= MAX_CONSECUTIVE_FAILURES:
             raise WriteAborted(
@@ -605,6 +862,7 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
         nonlocal consecutive
         if dry_run:
             stats[stat_key] += 1
+            gone.add(eid)
             return
         try:
             _execute(service.events().delete(calendarId=cal_id, eventId=eid))
@@ -613,60 +871,54 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
             # successful delete into a 404/410 on the retried call, so this is routine.
             if _status(e) in (404, 410):
                 stats[stat_key] += 1
+                gone.add(eid)
                 consecutive = 0
                 return
             guard(e, "delete", eid)
             return
         stats[stat_key] += 1
+        gone.add(eid)
         consecutive = 0
 
-    # A stale id falls into one of two very different cases, and they must not share an
-    # ordering:
-    #
-    #   BOOKED  — nothing in the feed covers that stylist-day any more. The entry is a
-    #             publicly advertised appointment that is already taken. Delete it FIRST;
-    #             that urgency is the whole reason deletes precede inserts.
-    #   RE-KEY  — the stylist-day IS still in the feed, under a different id. Under
-    #             `blocks` this happens constantly: the id is keyed on the block's first
-    #             opening, so booking (or merely passing) that opening re-keys the block.
-    #             Deleting first here removes still-bookable availability, and if the
-    #             replacement insert then fails the whole day is advertised nowhere while
-    #             the run still exits 0.
-    #
-    # So re-keys are deleted LAST, after their replacement is live — the same discipline
-    # the changeover purge uses.
-    def _is_rekey(eid: str) -> bool:
-        who = _stylist_of(existing[eid])
-        d = starts.get(eid)
-        return (who is not None and d is not None
-                and (who, d.date()) in _desired_days)
+    def do_patch(eid: str) -> None:
+        nonlocal consecutive
+        if dry_run:
+            stats["patch"] += 1
+            landed.add(eid)
+            return
+        try:
+            _execute(service.events().patch(calendarId=cal_id, eventId=eid,
+                                            body=desired[eid]))
+        except HttpError as e:
+            guard(e, "patch", eid)
+            return
+        stats["patch"] += 1
+        landed.add(eid)
+        consecutive = 0
 
-    booked = [eid for eid in stale if not _is_rekey(eid)]
-    rekeyed = [eid for eid in stale if _is_rekey(eid)]
-
-    # ---- 1. deletes, first: a stale event is a publicly advertised booked appointment ----
+    # ---- 1. deletes, first: nothing in the feed stands in for these ----
+    # Booked before history: a booked entry is a publicly advertised appointment that is
+    # already taken, so it must not be starved by a failure streak among mere clutter.
     if not blocked:
-        for eid in booked:
+        for eid in booked + history:
             do_delete(eid, "delete")
 
     # ---- 2. patches ----
+    # Every id in `landed` is an entry that is on the calendar exactly as this run wants it:
+    # patched, inserted, revived, or already right. Only these may justify retiring anything
+    # they replace. A write that failed is absent, and so is one never attempted because
+    # its stylist was withheld above — no write, so nothing failed, but nothing landed.
     for eid, body in desired.items():
         item = existing.get(eid)
         if item is None:
             continue
         if not _needs_patch(item, body, compare_description):
             stats["unchanged"] += 1
+            landed.add(eid)
             continue
-        if dry_run:
-            stats["patch"] += 1
-            continue
-        try:
-            _execute(service.events().patch(calendarId=cal_id, eventId=eid, body=body))
-        except HttpError as e:
-            guard(e, "patch", eid)
-            continue
-        stats["patch"] += 1
-        consecutive = 0
+        if eid in narrowing:
+            continue                 # pass 4, once what takes over its old span is live
+        do_patch(eid)
 
     # ---- 3. inserts, with the 409 tombstone fallback ----
     for eid, body in desired.items():
@@ -674,6 +926,7 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
             continue
         if dry_run:
             stats["insert"] += 1
+            landed.add(eid)
             continue
         try:
             _execute(service.events().insert(calendarId=cal_id, body=body))
@@ -689,37 +942,56 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
                 guard(e2, "insert", eid)
                 continue
             stats["revive"] += 1
+            landed.add(eid)
             consecutive = 0
             continue
         stats["insert"] += 1
+        landed.add(eid)
         consecutive = 0
 
-    # ---- 3b. re-keyed entries, now that their replacement is live ----
-    # Each of these is an entry whose stylist-day is still in the feed under a new id. The
-    # replacement insert has already run, so deleting now can never leave the day
-    # unrepresented — and if that insert failed, we keep the old entry instead of the day
-    # going dark.
-    if not blocked and rekeyed:
-        kept = 0
-        for eid in rekeyed:
-            replacement = next((k for k, day in _entry_day.items()
-                                if day == (_stylist_of(existing[eid]), starts[eid].date())),
-                               None)
-            if replacement is not None and replacement in failed_ids:
+    # ---- 4. what the writes above supersede, now that they have had their chance ----
+    # Each of these overlaps one or more entries of the same stylist that the feed still
+    # wants, and may be shrunk or removed only once EVERY one of them landed. Checking a
+    # single "replacement" per stylist-day picked the first entry of that day, so with a
+    # morning and an evening block, a failed evening insert was excused by the untouched
+    # morning one and the evening's still-bookable openings were advertised nowhere.
+    #
+    # A narrowing patch that has to wait keeps the wider old block, and a re-key keeps the
+    # whole entry: both still advertise the opening that was booked out of them, which is
+    # the lesser harm, and both count toward skipped_delete — retiring part of a span is a
+    # delete of that part. Narrowing patches go first: a block kept whole by an earlier run
+    # can overlap one being narrowed now, and its delete waits for that patch to land.
+    # Unlike the deletes they are not stopped by the guards above, any more than pass 2's
+    # patches are: everything that takes over their span has already landed.
+    kept_wide = 0
+    for eid, others in narrowing.items():
+        if all(r in landed for r in others):
+            do_patch(eid)
+        else:
+            kept_wide += 1
+            stats["skipped_delete"] += 1
+    kept = 0
+    if not blocked:
+        for eid, replacements in rekeyed.items():
+            if not all(r in landed for r in replacements):
                 kept += 1
                 stats["skipped_delete"] += 1
                 continue
             do_delete(eid, "delete")
-        if kept:
-            print(f"::warning::kept {kept} superseded entr(ies) whose replacement failed to "
-                  f"write — better a stale entry than an unrepresented day")
+    if kept or kept_wide:
+        print(f"::warning::kept {kept} superseded entr(ies) whole and {kept_wide} split "
+              f"block(s) at their old size, because what replaces them failed to write — "
+              f"better a stale entry than unrepresented availability")
 
-    # ---- 4. the event_style changeover purge, LAST and separately guarded ----
+    # ---- 5. the event_style changeover purge, LAST and separately guarded ----
     # These are entries written under the other style. They run after the inserts, not with
     # the deletes, so a changeover can only ever remove an entry once its replacement is
     # already live: if the write pass aborts partway (quota, auth, a failure streak) the old
     # entries are still standing. Doing this first — as the delete pass — meant an abort left
-    # the public calendar emptied with nothing written back.
+    # the public calendar emptied with nothing written back. Two checks, because they catch
+    # different failures: the aggregate below catches a fetch that lost most of the salon,
+    # and the per-entry one (obs_rekeyed) catches a single stylist's replacement failing
+    # while everyone else's landed.
     if obsolete_in_window and not blocked:
         # Size BOTH sides in openings, and count only the entries that actually LANDED.
         #
@@ -727,18 +999,11 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
         # availability), so an entry-count comparison would refuse a healthy slots->blocks
         # changeover and wave through a blocks->slots one that had lost most of its data.
         # And counting entries we merely intended to write would let a run that failed 200
-        # of its inserts still retire everything those inserts were meant to replace.
-        # ...and count only entries we actually TRIED to write. The symmetric withholding
-        # above pops a blind stylist's entries out of `desired`, so they are never inserted
-        # and never land in `failed_ids` either (no write was attempted, so nothing failed).
-        # Summing them here credited the replacement set with openings that are not on the
-        # calendar — inflating the one guard between a partial fetch and a changeover wipe
-        # by whatever share of the salon those stylists own (the busiest alone is ~15%).
-        live_now = sum(e.opening_count for e in entries
-                       if e.google_event_id() in desired
-                       and e.google_event_id() not in failed_ids)
+        # of its inserts still retire everything those inserts were meant to replace — or
+        # credit it with a withheld stylist's openings, which were never attempted at all
+        # (the busiest stylist alone is ~15% of the salon).
+        live_now = sum(_entry_openings[eid] for eid in landed)
         retiring = sum(_openings_of(obsolete[eid]) for eid in obsolete_in_window)
-        landed_entries = stats["insert"] + stats["revive"] + stats["patch"] + stats["unchanged"]
         if not allow_mass_delete and live_now < DELETE_BLAST_RADIUS * retiring:
             # The replacement set is implausibly small next to what we are about to remove.
             # This is the shape of a partial fetch on a changeover run, which would
@@ -746,20 +1011,52 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
             stats["blocked_delete"] += len(obsolete_in_window)
             print(f"::error::refusing to retire {len(obsolete_in_window)} entries "
                   f"({retiring} openings) from the previous event_style: the "
-                  f"{landed_entries} replacement entries that landed cover only "
+                  f"{len(landed)} replacement entries that landed cover only "
                   f"{live_now} openings. Fix the fetch first, or re-run with "
                   f"--allow-mass-delete.")
         else:
-            print(f"retiring {len(obsolete_in_window)} entries ({retiring} openings) from "
-                  f"the previous event_style ({landed_entries} entries covering "
+            print(f"retiring up to {len(obsolete_in_window)} entries ({retiring} openings) "
+                  f"from the previous event_style ({len(landed)} entries covering "
                   f"{live_now} openings are live)")
+            kept_obs = 0
             for eid in obsolete_in_window:
+                replacements = obs_rekeyed.get(eid)
+                if replacements and not all(r in landed for r in replacements):
+                    kept_obs += 1
+                    stats["skipped_delete"] += 1
+                    continue
                 do_delete(eid, "migrated")
+            if kept_obs:
+                print(f"::warning::kept {kept_obs} entr(ies) of the previous event_style "
+                      f"whose replacement failed to write; the next run retires them")
 
     if failures:
         print(f"::warning::{len(failures)} write(s) failed; first 20:")
         for f in failures[:20]:
             print(f"  {f}")
+
+    # What a subscriber can now see, in openings: everything that landed, plus every entry
+    # of ours this run left standing and that has not ended — the out-of-window days a near
+    # run never looked at, a withheld stylist's day, a superseded entry kept because its
+    # replacement failed. Counting only this run's own entries reported 21 days of a 90-day
+    # calendar on every near run, understating it several-fold and jumping at each deep
+    # sweep. Landed entries count at their new size; the rest at their stamped one, less
+    # whatever their own landed replacements already advertise — a kept re-key and the
+    # replacements that DID land show the same openings twice, and on a run whose deletes
+    # the blast-radius guard refused, that is every re-keyed stylist-day.
+    left = {**existing, **obsolete}
+    left_ends = {**ends, **obs_ends}
+    superseded = {**rekeyed, **narrowing, **obs_rekeyed}
+
+    def still_shown(eid: str, item: dict) -> int:
+        shared = sum(_entry_openings[r] for r in superseded.get(eid, ()) if r in landed)
+        return max(0, _openings_of(item) - shared)
+
+    stats["live_openings"] = (
+        sum(_entry_openings[eid] for eid in landed)
+        + sum(still_shown(eid, item) for eid, item in left.items()
+              if eid not in landed and eid not in gone
+              and left_ends[eid] is not None and left_ends[eid] >= now))
 
     # Patch-churn alarm. _PATCH_FIELDS is deliberately minimal because any field Google
     # normalizes on write will fail to compare equal on the next run and rewrite the entire
@@ -796,18 +1093,38 @@ def result_to_json(result: FetchResult, lookahead_days: int | None = None) -> st
         "lookups_failed": result.lookups_failed,
         "errors": result.errors,
         "staff_ok": sorted(result.staff_ok) if result.staff_ok is not None else None,
+        # Both decide what a replay may delete, so a replay that dropped them would judge
+        # the capture by different rules than the run that made it: without staff_planned
+        # every departed stylist reads as a failed lookup again, and without window_start
+        # the window is re-anchored on the day of the REPLAY.
+        "staff_planned": (sorted(result.staff_planned)
+                          if result.staff_planned is not None else None),
+        "window_start": result.window_start.isoformat() if result.window_start else None,
         "events": [event_to_dict(e) for e in result.events],
     }, indent=1)
 
 
 def result_from_json(text: str) -> FetchResult:
+    """Inverse of result_to_json. Captures written before a key existed load it as None —
+    'unknown' — which sync() handles with its legacy rule for each, never as an empty set
+    or today's date, which would each assert something the capture never recorded."""
     d = json.loads(text)
+    window_start = None
+    if d.get("window_start"):
+        try:
+            window_start = date.fromisoformat(d["window_start"])
+        except (ValueError, TypeError):
+            print(f"::warning::ignoring unreadable window_start {d['window_start']!r} "
+                  f"in the capture")
     return FetchResult(
         slots=[], events=[event_from_dict(e) for e in d.get("events", [])],
         notices=d.get("notices"), ok=bool(d.get("ok")),
         lookups_ok=d.get("lookups_ok", 0), lookups_failed=d.get("lookups_failed", 0),
         errors=d.get("errors", []),
-        staff_ok=set(d["staff_ok"]) if d.get("staff_ok") is not None else None)
+        staff_ok=set(d["staff_ok"]) if d.get("staff_ok") is not None else None,
+        staff_planned=(set(d["staff_planned"])
+                       if d.get("staff_planned") is not None else None),
+        window_start=window_start)
 
 
 def _github_output(key: str, value: str) -> None:
@@ -838,8 +1155,15 @@ def _summary_line(text: str) -> None:
 # ---------------------------------------------------------------- CLI
 def main(argv=None):
     """Entry point. `argv` is a test seam: tests drive the decision points here — the
-    untrusted-fetch write refusal, the exit codes, the .ics gating, the marker stamp —
-    without patching sys.argv."""
+    untrusted-fetch write refusal, the exit codes, the .ics gating, the marker stamp, the
+    skip gate — without patching sys.argv.
+
+    Order matters and is deliberate: read the marker once, publish the health output, run
+    the skip gate, stamp last_attempt, and only then resolve depth and contact Timely. A
+    skipped tick therefore costs a couple of calendar reads (preflight's calendars.get and
+    the marker) and zero Timely requests, and a calendar we can read but not write stops
+    at the stamp, before Timely is sent anything.
+    """
     ap = argparse.ArgumentParser(description="Sync KIDA NYC open slots to Google Calendar")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the insert/patch/delete diff without writing")
@@ -853,9 +1177,13 @@ def main(argv=None):
                     help="skip the Timely fetch and load a previous result from this path")
     ap.add_argument("--allow-mass-delete", action="store_true",
                     help="bypass the delete blast-radius guard (manual recovery only)")
+    ap.add_argument("--skip-if-checked-within", type=int, default=0, metavar="MINUTES",
+                    help="with --depth auto only: exit 0 without contacting Timely if the "
+                         "last run STARTED less than this many minutes ago (0 = never skip)")
     args = ap.parse_args(argv)
 
     config = Config.load(args.config)
+    tz = ZoneInfo(config.timezone)
     # The configured DEEP window, captured before resolve_depth overwrites lookahead_days
     # with this run's tier. Anything asking "was this really a full sweep?" must compare
     # against this, not against the already-resolved value.
@@ -874,12 +1202,59 @@ def main(argv=None):
                 raise
 
     cal_id = None
+    marker = None
     if service is not None:
         cal_id = ensure_calendar(service, config, dry_run=args.dry_run)
         preflight(service, cal_id)      # fail in 1 second, not after an 85-minute fetch
+        # Read ONCE. The health output, the skip gate, the depth decision and the final
+        # deep-sweep stamp all need it, and each must judge the same copy.
+        marker = read_marker(service, cal_id)
+    started = datetime.now(tz)
+
+    # Published before anything slow or fallible, so the workflow's failure handling can
+    # always tell a one-off blip from a calendar that has been stale for hours — even when
+    # this run dies in the fetch. last_run is only ever written by a run that exits 0 (see
+    # write_marker), so this is the age of the last SUCCESS, not of the last attempt. Empty
+    # means unknown: no marker yet, a marker no run has succeeded on, or a last_run in the
+    # future, which only a broken clock or a hand-edited marker can produce.
+    since_ok = _elapsed(_marker_time(marker, "last_run"), started)
+    _github_output("last_success_age_hours",
+                   f"{since_ok.total_seconds() / 3600:.1f}"
+                   if since_ok is not None and since_ok >= timedelta(0) else "")
+
+    # The skip gate. Hourly ticks are not hourly: GitHub delays and bunches them, and a
+    # manual dispatch lands wherever it lands, so two runs can start minutes apart and walk
+    # the same Timely funnel twice. Measured START-TO-START off last_attempt, so a long
+    # deep sweep does not make the next on-time tick look premature. Only `auto` is gated:
+    # an explicit near/full is a person asking for a run now. A last_attempt in the future
+    # is a broken clock, not a recent run, and must not silence the sync indefinitely.
+    if args.depth == "auto" and args.skip_if_checked_within > 0:
+        since = _elapsed(marker_last_attempt(marker), started)
+        if (since is not None
+                and timedelta(0) <= since < timedelta(minutes=args.skip_if_checked_within)):
+            msg = (f"skip: the last run started {int(since.total_seconds() // 60)} min ago, "
+                   f"within --skip-if-checked-within {args.skip_if_checked_within}; not "
+                   f"contacting Timely this tick")
+            print(msg)
+            _github_output("skipped", "true")
+            _summary_line(f"⏭ {msg}")
+            return
+    _github_output("skipped", "false")
+    # Only an existing marker is stamped. Creating one here would publish a 'checked'
+    # title for a run that has not checked anything yet; write_marker() at the end carries
+    # `started` into the marker it creates instead. Every non-skipped run stamps, near and
+    # full included: they are not gated, but they are attempts, and an auto tick landing
+    # behind one must see it.
+    if marker is not None and not args.dry_run:
+        try:
+            stamp_last_attempt(service, cal_id, marker, started)
+        except WriteAborted as e:
+            print(f"::error::{e}")
+            _summary_line(f"❌ cannot write to the calendar: {e}")
+            raise SystemExit(1)
 
     # Depth first: it decides how far the fetch reaches.
-    days, deep = resolve_depth(service, cal_id, config, args.depth)
+    days, deep = resolve_depth(config, args.depth, marker, now=started)
     config.lookahead_days = days
     print(f"depth: {'FULL' if deep else 'near'} ({days} days)")
 
@@ -901,8 +1276,12 @@ def main(argv=None):
         # feed and stamps last_deep_sweep, suppressing the real sweep for hours.
         if captured:
             deep = int(captured) >= deep_window
+        # The capture's own window_start rides along in `result`, so sync() anchors the
+        # window on the day the capture was FETCHED. Re-anchoring it on the replay day
+        # would put every day after the captured window inside it, and delete it unseen.
         print(f"loaded {len(result.events)} events from {args.from_json} "
-              f"({config.lookahead_days}-day window)")
+              f"({config.lookahead_days}-day window from "
+              f"{result.window_start or 'an unrecorded start'})")
     else:
         result = fetch(config)
 
@@ -946,8 +1325,7 @@ def main(argv=None):
                   f"published feed with an empty one.")
         else:
             from . import ics_export
-            ics_export.write(args.ics, entries, result.notices,
-                             datetime.now(ZoneInfo(config.timezone)))
+            ics_export.write(args.ics, entries, result.notices, datetime.now(tz))
             print(f"wrote {args.ics} ({len(entries)} entries)")
 
     # An untrusted fetch must write NOTHING. Previously this check ran after sync(), so a
@@ -970,41 +1348,55 @@ def main(argv=None):
         f"{k}={v}" for k, v in stats.items() if v)
     print(line)
     _summary_line(f"### {'FULL' if deep else 'near'} sweep · {days}d\n"
-                  f"- {len(result.events)} openings → {len(entries)} entries\n"
+                  f"- {len(result.events)} openings fetched → {len(entries)} entries; "
+                  f"{stats['live_openings']} openings live on the calendar\n"
                   f"- `{line}`\n"
                   f"- {result.requests_made} Timely requests "
                   f"({result.requests_saved} saved by dedup), "
                   f"{result.lookups_ok}/{result.lookups_expected} lookups ok")
 
+    # The exit decision comes BEFORE the marker, because the marker records it: last_run is
+    # the last run that exits 0. Deciding afterwards stamped last_run on runs about to exit
+    # 1, so a persistent failure published last_success_age_hours of ~1 on every run — the
+    # workflow's 12-hour issue threshold was never reached, and the skipped ticks behind
+    # each failure looked fresh enough to ping the heartbeat.
+    failed = write_failures(stats)
+    errors = []
+    if failed > max(FAILURE_EXIT_FLOOR, FAILURE_EXIT_SHARE * writes_attempted(stats)):
+        errors.append(f"::error::{failed} write failures out of {writes_attempted(stats)} "
+                      f"attempted")
+    # A refused delete pass already said why, as an ::error:: from sync().
+    failing = bool(errors) or bool(stats["blocked_delete"])
+    # A run that refused a large share of its deletes did not do its job, even though every
+    # call it made succeeded. Reporting green there is how a partial outage stays invisible.
+    if stats["skipped_delete"] > SKIPPED_DELETE_EXIT_FLOOR:
+        failing = True
+        errors.append(f"::error::{stats['skipped_delete']} deletes were withheld this run "
+                      f"(stylists we could not see completely, or replacements that failed "
+                      f"to write). The calendar is stale for those people.")
+
     if service is not None and not args.dry_run:
-        now = datetime.now(ZoneInfo(config.timezone))
+        now = datetime.now(tz)
         # Only a deep sweep that actually completed cleanly may claim one happened. A run
         # that lost writes or had its delete pass refused did NOT refresh the far window,
         # and stamping it would suppress the corrective sweep for deep_sweep_every_hours.
         clean = write_failures(stats) == 0 and not stats["blocked_delete"]
-        last_deep = (now if (deep and clean)
-                     else marker_last_deep_sweep(read_marker(service, cal_id)))
+        last_deep = now if (deep and clean) else marker_last_deep_sweep(marker)
         if deep and not clean:
             print("::warning::deep sweep did not complete cleanly; not recording it as one, "
                   "so the next run will sweep deep again")
         write_marker(service, cal_id, checked_at=now,
-                     # Report openings, not entries: under `blocks` an entry count would
-                     # understate availability ~3.3x to anyone reading the calendar.
-                     entry_count=sum(e.opening_count for e in entries),
-                     last_deep=last_deep)
+                     # Openings, not entries: under `blocks` an entry count would understate
+                     # availability ~3.3x. And everything of ours left live, not just this
+                     # run's window: a near run sees 21 of 90 days. See sync().
+                     entry_count=stats["live_openings"],
+                     last_deep=last_deep, last_attempt=started,
+                     succeeded=not failing,
+                     previous_success=_marker_time(marker, "last_run"))
 
-    failed = write_failures(stats)
-    if failed > max(FAILURE_EXIT_FLOOR, FAILURE_EXIT_SHARE * writes_attempted(stats)):
-        print(f"::error::{failed} write failures out of {writes_attempted(stats)} attempted")
-        raise SystemExit(1)
-    if stats["blocked_delete"]:
-        raise SystemExit(1)
-    # A run that refused a large share of its deletes did not do its job, even though every
-    # call it made succeeded. Reporting green there is how a partial outage stays invisible.
-    if stats["skipped_delete"] > SKIPPED_DELETE_EXIT_FLOOR:
-        print(f"::error::{stats['skipped_delete']} deletes were withheld this run "
-              f"(stylists we could not see completely, or replacements that failed to "
-              f"write). The calendar is stale for those people.")
+    for msg in errors:
+        print(msg)
+    if failing:
         raise SystemExit(1)
 
 

@@ -5,10 +5,13 @@ Wraps the stateful cookie + `obg` funnel documented in docs/timely-api.md. No br
 required. One TimelyClient instance == one HTTP session (its own cookie jar), so create
 a fresh client per service (service is baked into the session; staff/date are params).
 
-Politeness: a shared request delay, exponential backoff on 429/5xx, and a hard per-run
-request cap enforced across all clients via a module-level counter. When the host asks us
-to back off for longer than we are willing to sleep, or keeps 429ing, we stop the run and
-report rather than grinding — see docs/compliance.md.
+Politeness: a shared request delay, exponential backoff on 429/5xx (and on connection
+failures and timeouts, which are retried the same way but never counted as throttles),
+and a hard per-run request cap enforced across all clients via a module-level counter.
+When the host asks us to back off for longer than we are willing to sleep, keeps 429ing,
+or stops answering at all, we stop the run and report rather than grinding — see
+docs/compliance.md. A connection broken mid-response (requests' ChunkedEncodingError) is
+NOT among the retried failures; see the note in TimelyClient._request.
 """
 from __future__ import annotations
 
@@ -64,6 +67,34 @@ MAX_CONSECUTIVE_THROTTLES = 3
 # scattering single throttles across all four endpoints still stops promptly.
 MAX_THROTTLED_REQUESTS_PER_RUN = 5
 
+# Connection failures and timeouts have stop conditions of their own. They cannot share
+# the throttle counters above — a timeout is not Timely asking us to slow down, and at
+# 3-and-5 a handful of unlucky reads would abort a healthy sweep as untrusted — but they
+# cannot have none either. Once they were retried (5 attempts with backoff: ~3 min per
+# request against a host that never answers, instead of the old ~30s), one hung endpoint
+# — the per-step degradation the throttle notes above describe, say GetOpenDates
+# read-timing-out while bootstrap and both POSTs stay healthy — cost every lookup ~3 min.
+# Simulated, a deep sweep then ran ~185 min, well past the 120-min timeout-minutes at
+# which GitHub kills the job (so no fetch artifact, no exit 2, and the sync concurrency
+# group held for two hours), and the hung endpoint took 300 requests with nothing to stop
+# them. Before transport retries the same run ended untrusted in ~34 min.
+#
+# Consecutive REQUESTS that used up every attempt and ended without a response (their
+# last attempt a connection failure or timeout), keyed per (method, path) and cleared
+# only by that endpoint's own success, for the same reasons as MAX_CONSECUTIVE_THROTTLES.
+# Three of them (~9 min) is a host that is not answering, not a blip: even at a 10%
+# per-attempt failure rate one request loses all five attempts about once in 100,000, so
+# this never fires on a merely flaky network.
+MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3
+# ...and a run-wide backstop on failed ATTEMPTS, never cleared by any success, because
+# what runs out here is time. Each failed attempt costs up to ~50s (the 30s timeout, up
+# to 16s of backoff, pacing) whether or not its request then recovers, so a network
+# losing 5% of requests at random never forms a streak yet still pushed a simulated deep
+# sweep to ~126 min. 50 failed attempts add under 45 min to the observed ~38-min deep
+# sweep — inside the 120-min job timeout — and are ~12x the 4 timeouts that cost the
+# 2026-09-05 run its lookups, so ordinary flakiness still recovers rather than aborting.
+MAX_TRANSPORT_ERRORS_PER_RUN = 50
+
 _OBG_RE = re.compile(r"/Booking/Service\?obg=([0-9a-f-]{36})")
 _SERVICE_RE = re.compile(
     r'<input[^>]*id="service(\d+)"[^>]*?data-staffids="([^"]*)"[^>]*?'
@@ -85,7 +116,8 @@ class TimelyError(RuntimeError):
 
 
 class BudgetExhausted(TimelyError):
-    """The per-run request cap or the throttle stop-condition tripped.
+    """The per-run request cap, a throttle stop condition, or a transport-failure stop
+    condition (a host that stopped answering) tripped.
 
     This is NOT a per-lookup failure: it means the rest of the run's data is missing, so it
     must never be laundered into a failure count that still reports the fetch as healthy.
@@ -160,6 +192,11 @@ class _Budget:
         # (method, path) -> consecutive fully-throttled requests for that endpoint.
         self.throttles: dict[tuple[str, str], int] = {}
         self.throttled_total = 0  # every fully-throttled request this run; never cleared
+        # (method, path) -> consecutive requests to that endpoint that used up every
+        # attempt and ended without a response. Kept apart from `throttles`: see
+        # MAX_CONSECUTIVE_TRANSPORT_FAILURES.
+        self.transport_streaks: dict[tuple[str, str], int] = {}
+        self.transport_errors = 0  # every failed transport ATTEMPT this run; never cleared
         self._last = 0.0
 
     def configure(self, cap: int, delay: float):
@@ -170,10 +207,13 @@ class _Budget:
         self.made = 0
         self.throttles = {}
         self.throttled_total = 0
+        self.transport_streaks = {}
+        self.transport_errors = 0
 
     @staticmethod
     def _endpoint(method: str, url: str) -> tuple[str, str]:
-        """Identify the endpoint a throttle belongs to, ignoring the per-session `obg`.
+        """Identify the endpoint a throttle or transport failure belongs to, ignoring the
+        per-session `obg`.
 
         Every funnel url carries a fresh `obg` query param, so keying on the full url would
         give each service its own counter and no streak could ever build. The path alone is
@@ -210,10 +250,41 @@ class _Budget:
                 f"throttling us broadly enough that the streak counter never trips. "
                 f"Stopping; the next run will retry.")
 
+    def transport_failed(self, method: str, url: str, error: BaseException, *,
+                         request_exhausted: bool):
+        """One ATTEMPT that got no response at all (connection failure or timeout).
+
+        `request_exhausted` marks the request's last attempt: only a request that used up
+        every attempt and ended this way extends its endpoint's streak, while every failed
+        attempt counts toward the run-wide total. Never feeds the throttle counters — see
+        the note on MAX_CONSECUTIVE_TRANSPORT_FAILURES.
+        """
+        self.transport_errors += 1
+        verb, path = self._endpoint(method, url)
+        if request_exhausted:
+            n = self.transport_streaks.get((verb, path), 0) + 1
+            self.transport_streaks[(verb, path)] = n
+            if n >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+                raise BudgetExhausted(
+                    f"{n} consecutive {verb} {path} requests used up every attempt and "
+                    f"ended without a response (last: {type(error).__name__}: {error}) — "
+                    f"that endpoint is not answering. Stopping this run rather than "
+                    f"grinding through it; the next run will retry.")
+        if self.transport_errors >= MAX_TRANSPORT_ERRORS_PER_RUN:
+            raise BudgetExhausted(
+                f"{self.transport_errors} connection failures/timeouts this run (last: "
+                f"{verb} {path}: {type(error).__name__}: {error}) — each costs up to a "
+                f"30s timeout plus backoff, so a run absorbing more risks outrunning its "
+                f"job timeout. Stopping; the next run will retry.")
+
     def cleared(self, method: str, url: str):
         """A success only vouches for the endpoint it came from — see the note on
-        MAX_CONSECUTIVE_THROTTLES for why a sibling's success must not clear this."""
-        self.throttles[self._endpoint(method, url)] = 0
+        MAX_CONSECUTIVE_THROTTLES for why a sibling's success must not clear this. It
+        clears that endpoint's transport streak as well as its throttle streak: either
+        way, the endpoint is answering again."""
+        key = self._endpoint(method, url)
+        self.throttles[key] = 0
+        self.transport_streaks[key] = 0
 
 
 BUDGET = _Budget()
@@ -307,6 +378,18 @@ def _looks_like_empty_day(html: str) -> bool:
     return bool(_NO_TIMES_RE.search(html) or _DAY_HEADER_RE.search(html))
 
 
+def _on_service_selection_page(html: str) -> bool:
+    """Is this step 1 of the funnel — the service-selection form?
+
+    Keyed ONLY on that form's own fields (the service checkboxes and the ServiceStaffIds
+    hidden inputs), never on a /Booking/Service?obg= link: later pages link back to step
+    1, so keying on the link would refuse every advanced page. Both funnel POSTs use this
+    as their "did not advance" check; see the notes in select_service and select_staff
+    for what each can and cannot prove.
+    """
+    return bool(_SERVICE_STAFF_RE.search(html) or _SERVICE_RE.search(html))
+
+
 class TimelyClient:
     def __init__(self, cache=None, cache_ns=""):
         self.session = requests.Session()
@@ -330,7 +413,52 @@ class TimelyClient:
         backoff = 2.0
         for attempt in range(5):
             BUDGET.tick(extra_delay)
-            resp = self.session.request(method, url, data=data, headers=headers, timeout=30)
+            try:
+                resp = self.session.request(method, url, data=data, headers=headers,
+                                            timeout=30)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                # A connection that fails before any response arrives (refused, reset, or
+                # closed before the status line) or a connect/read timeout is the most
+                # ordinary transient failure there is, and it used to escape on the FIRST
+                # attempt — only 429/5xx were retried. The 2026-09-05 run lost 4 lookups to
+                # "Read timed out. (read timeout=30)", each charged as a failed lookup
+                # (costing that stylist delete authority), and exited 1. So: the same
+                # backoff and the same 5-attempt limit as a 5xx. There is no Retry-After on
+                # a response we never received, so the plain backoff applies.
+                #
+                # Deliberately NOT reported to BUDGET.throttled(): the throttle stop
+                # conditions mean "Timely asked us to slow down", and a timeout says no
+                # such thing — at a streak of 3 and a run-wide total of 5, a few unlucky
+                # reads would abort a healthy sweep as untrusted. BUDGET.transport_failed()
+                # counts them instead, against thresholds sized for a network rather than a
+                # rate limiter, and raises BudgetExhausted when one trips. That is not
+                # optional: one request against a black-holed host now takes up to 5 x 30s
+                # + 30s of backoff instead of 30s, and without those stop conditions one
+                # hung endpoint pushed a deep sweep past the job's 120-min timeout (see
+                # MAX_CONSECUTIVE_TRANSPORT_FAILURES). Each attempt also still ticks the
+                # budget above, so these retries can never take the run past the request
+                # cap. Re-sending one of the two funnel POSTs books nothing — it re-selects
+                # the same service or staff on an anonymous session (docs/compliance.md) —
+                # and the "did not advance" checks in select_service/select_staff still vet
+                # whatever page the retry lands on.
+                #
+                # Only these two families (requests files SSLError and ProxyError under
+                # ConnectionError, so those retry too). NOT retried: a connection broken
+                # MID-BODY, after the status line arrived — requests raises
+                # ChunkedEncodingError ("Connection broken: IncompleteRead") for that,
+                # which is not a ConnectionError. Waiting might well fix it, but widening
+                # the retry set is a separate decision, so for now it fails its lookup on
+                # the first attempt exactly as before. The rest of what requests raises —
+                # an invalid url, a redirect loop — fails identically on every attempt, so
+                # retrying it would only spend requests.
+                BUDGET.transport_failed(method, url, e, request_exhausted=(attempt == 4))
+                if attempt == 4:
+                    raise TimelyError(
+                        f"{method} {url} failed after 5 attempts: "
+                        f"{type(e).__name__}: {e}") from e
+                time.sleep(backoff)
+                backoff *= 2
+                continue
             if resp.status_code in (429, 500, 502, 503, 504):
                 raw = resp.headers.get("Retry-After")
                 try:
@@ -396,16 +524,44 @@ class TimelyClient:
         # live funnel 2026-08-09: both are absent once it advances. A link back to
         # /Booking/Service?obg=... IS still present on the advanced page, so `_OBG_RE` must
         # NOT be used here — it would fail every service on every run.
-        if _SERVICE_STAFF_RE.search(html) or _SERVICE_RE.search(html):
+        if _on_service_selection_page(html):
             raise TimelyError(
                 "POST /Booking/Service came back on the service-selection page — the funnel "
                 "did not advance (session reset, or an edge interstitial). Refusing to read "
                 "availability from a session still parked at step 1.")
 
     def select_staff(self, staff_id: str):
-        self._request("POST", f"{BASE}/Booking/StaffSelection?obg={self.obg}",
-                      data={"SelectedStaffId": str(staff_id), "commit": ""},
-                      extra_delay=POST_EXTRA_DELAY_SECONDS)
+        html = self._request("POST", f"{BASE}/Booking/StaffSelection?obg={self.obg}",
+                             data={"SelectedStaffId": str(staff_id), "commit": ""},
+                             extra_delay=POST_EXTRA_DELAY_SECONDS)
+        # The same hole select_service closed, one step later, and it had no guard at all:
+        # if the session was reset between the two POSTs, this one lands back on step 1,
+        # GetOpenDates answers a well-formed empty {"openDates": []} for every stylist, and
+        # each lookup "succeeds" with zero openings while keeping delete authority.
+        #
+        # What this DOES detect: a reset to step 1, by the same service-form markup as
+        # above. The DateSelection page this POST 302s to has never been captured, so this
+        # rests on the pattern the step-2 capture shows
+        # (tests/fixtures/post_service_advanced_2026-08-09.html): Timely keeps a back-LINK
+        # to an earlier step but drops that step's form fields. Step 1's checkboxes and
+        # ServiceStaffIds inputs are already gone one step on; only step 1 itself would
+        # bring them back.
+        #
+        # What it does NOT detect, on purpose: this POST bouncing back to the staff page
+        # itself (a rejected SelectedStaffId), or an edge interstitial that is neither
+        # page. The staff page does have distinctive markup — `staff-selection-form`, the
+        # `SelectedStaffId` radios, a form posting to /Booking/StaffSelection — but nothing
+        # in this repo proves that markup is ABSENT from the DateSelection page. That same
+        # back-link pattern makes a /Booking/StaffSelection?obg= link there likely, and a
+        # "change stylist" control named SelectedStaffId is entirely plausible; a guard
+        # keyed on either would fail every lookup of every run and take the calendar
+        # down. Capture a live DateSelection response into tests/fixtures before adding a
+        # positive "advanced" check, or a "still on step 2" check, here.
+        if _on_service_selection_page(html):
+            raise TimelyError(
+                "POST /Booking/StaffSelection came back on the service-selection page — the "
+                "funnel did not advance (the session was reset to step 1). Refusing to read "
+                "availability from a session that has no service selected.")
 
     def open_dates(self, staff_id: str, month: int, year: int) -> list[dict]:
         url = (f"{BASE}/Booking/GetOpenDates?obg={self.obg}&month={month}&year={year}"

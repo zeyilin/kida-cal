@@ -1,23 +1,34 @@
 """Tests for the fetch orchestration: request de-duplication, health thresholds, and the
 budget stop-condition. No network — a fake funnel client stands in for Timely."""
+import random
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from conftest import mkconfig
+from src import fetch_availability as fa
 from src import timely
-from src.fetch_availability import MIN_LOOKUP_SUCCESS_RATIO, fetch
+from src.catalog import STAFF
+from src.fetch_availability import (MIN_LOOKUP_SUCCESS_RATIO, _service_allowed,
+                                    _stylist_allowed, fetch)
 from src.timely import BudgetExhausted, RawSlot
 
 # Two staff we have in the catalog, so nothing is skipped as unknown.
 NAO, SACHI = "175308", "24102"
+NY = ZoneInfo("America/New_York")
 
 
 def _open_days(n=6):
     """A realistic run of open days. A single-day window would hide the de-duplication
     entirely: the first day of every (service, staff) pair is always a real request,
-    because that response is what tells us the pair's duration."""
-    return [(date.today() + timedelta(days=i + 1)).isoformat() for i in range(n)]
+    because that response is what tells us the pair's duration.
+
+    Counted from New York's date, as fetch() counts its window, and read through fetch()'s
+    own clock — so a test that freezes that clock (see ny_evening) moves these days too."""
+    start = fa.datetime.now(NY).date()
+    return [(start + timedelta(days=i + 1)).isoformat() for i in range(n)]
 
 
 class FakeClient:
@@ -41,22 +52,37 @@ class FakeClient:
     fail_staff_for: set = set()
     budget_error_on: set = set()
     budget_error_setup_for: set = set()
+    # Every client (== Timely session) in creation order, as (cache_ns, funnel steps it got
+    # through), and the session number of every gettimeslots request. Sessions are numbered
+    # by creation, so failures can target ones opened after the sweep without touching it.
+    sessions: list = []
+    slot_sessions: list = []
+    fail_sessions: set = set()           # session numbers whose bootstrap raises
+    budget_error_sessions: set = set()   # session numbers whose bootstrap is throttled
 
     def __init__(self, cache=None, cache_ns=""):
         self.ns = cache_ns
+        self.n = len(FakeClient.sessions)
+        self.steps = []
+        FakeClient.sessions.append((cache_ns, self.steps))
 
     def bootstrap(self):
+        if self.n in FakeClient.budget_error_sessions:
+            raise BudgetExhausted("throttled opening a session")
+        if self.n in FakeClient.fail_sessions:
+            raise RuntimeError("session would not open")
         if self.ns in self.budget_error_setup_for:
             raise BudgetExhausted("throttled during funnel setup")
         if self.ns in self.fail_setup_for:
             raise RuntimeError("funnel setup exploded")
+        self.steps.append("bootstrap")
         return list(self.catalog), {"ServiceStaffIds[x:SV]": ""}
 
     def select_service(self, bookable_item_id, service_staff_ids):
-        pass
+        self.steps.append("service")
 
     def select_staff(self, staff_id):
-        pass
+        self.steps.append("staff")
 
     def open_dates(self, staff_id, month, year):
         FakeClient.calls.append(("open_dates", self.ns, staff_id, year, month))
@@ -70,6 +96,7 @@ class FakeClient:
         if (self.ns, staff_id) in self.fail_staff_for:
             raise RuntimeError("lookup exploded")
         FakeClient.calls.append(("time_slots", self.ns, staff_id, date_iso))
+        FakeClient.slot_sessions.append(self.n)
         dur = self.durations[self.ns]
         return [RawSlot(date=date_iso, service_id=self.ns, staff_id=staff_id,
                         start_min=m, end_min=m + dur, token="t")
@@ -83,13 +110,18 @@ def _reset():
     FakeClient.fail_staff_for = set()
     FakeClient.budget_error_on = set()
     FakeClient.budget_error_setup_for = set()
+    FakeClient.sessions = []
+    FakeClient.slot_sessions = []
+    FakeClient.fail_sessions = set()
+    FakeClient.budget_error_sessions = set()
     yield
 
 
-def _fetch(**kw):
+def _fetch(rng=None, **kw):
     kw.setdefault("verify_dedup_samples", 0)
     cfg = mkconfig(lookahead_days=10, **kw)
-    return fetch(cfg, client_factory=FakeClient)
+    # Seeded: which memo hits get spot-checked is random by design, and a test must not be.
+    return fetch(cfg, client_factory=FakeClient, rng=rng or random.Random(0))
 
 
 def _timeslot_calls():
@@ -146,9 +178,341 @@ def test_different_durations_are_never_shared():
 
 
 def test_verification_sampling_refetches_a_few_memo_hits():
-    _fetch(verify_dedup_samples=2)
-    # The spot-checks are extra live calls on top of the de-duplicated set.
-    assert len(_timeslot_calls()) > 3
+    """The spot-checks are extra live calls on top of the de-duplicated set — and never
+    two in one pair. The old sampler spent all four on svcB/Nao's days 2-5."""
+    _fetch(verify_dedup_samples=4)
+    per_pair = Counter((ns, staff) for _, ns, staff, _ in _timeslot_calls())
+    # svcB is the only memo-served service: one check on each of its pairs, on top of the
+    # one duration probe. svcC (85 min) is never memo-served, so it cannot use a check.
+    assert per_pair[("svcB", NAO)] == 2
+    assert per_pair[("svcB", SACHI)] == 2
+
+
+# The salon has runs of same-length variants (Hair Cut / Blow Out, three 55-minute barber
+# combos, four 55-minute junior services). This fixture is that shape: five 55-minute
+# services over the same two stylists. s1 walks every day; s2..s5 are served from its memo
+# after one duration probe each, so they are the only pairs a spot-check can land on.
+class FiveCuts(FakeClient):
+    durations = {f"s{i}": 55 for i in range(1, 6)}
+    catalog = [{"service_id": f"s{i}", "name": f"Cut {i}", "staff_ids": [NAO, SACHI],
+                "bookable_item_id": f"s{i}:SV"} for i in range(1, 6)]
+    diverge: set = set()          # services whose live answer differs at the same duration
+
+    def time_slots(self, staff_id, date_iso):
+        FakeClient.calls.append(("time_slots", self.ns, staff_id, date_iso))
+        FakeClient.slot_sessions.append(self.n)
+        starts = (900,) if self.ns in FiveCuts.diverge else (600, 660)
+        return [RawSlot(date=date_iso, service_id=self.ns, staff_id=staff_id,
+                        start_min=m, end_min=m + 55, token="t") for m in starts]
+
+
+def _five_cuts(seed, budget, diverge=()):
+    FakeClient.calls = []
+    FiveCuts.diverge = set(diverge)
+    result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=budget),
+                   client_factory=FiveCuts, rng=random.Random(seed))
+    return result, [c for c in FakeClient.calls if c[0] == "time_slots"]
+
+
+def _spot_checks(calls):
+    """(service, staff, day) of every live re-fetch beyond the de-duplicated minimum. Only
+    meaningful while the memo held: in s2..s5 a pair's first call is its duration probe,
+    so every further call is a check."""
+    by_pair = {}
+    for _, ns, staff, day in calls:
+        by_pair.setdefault((ns, staff), []).append(day)
+    return [(ns, staff, day) for (ns, staff), days in by_pair.items() if ns != "s1"
+            for day in days[1:]]
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_a_later_service_breaking_the_invariant_is_caught(seed):
+    """The old sampler spent every check on the first memo hits in plan order — the same
+    pair's days 2..5 on every run — so a later service with genuinely different openings
+    at the same duration was never compared and was published wrong under ok=True. With
+    as many checks as memo-served services, each of them now gets one, whatever the draw."""
+    result, _ = _five_cuts(seed, budget=4, diverge={"s5"})
+    assert result.ok is False
+    assert any("dedup invariant broken for Cut 5" in e for e in result.errors)
+
+
+def test_spot_checks_spread_across_services_and_rotate_between_runs():
+    days = len(_open_days())
+    services, pairs, check_days = set(), set(), set()
+    for seed in range(30):
+        result, calls = _five_cuts(seed, budget=2)
+        checks = _spot_checks(calls)
+        # The whole budget, as there are more memo-served pairs than checks...
+        assert len(checks) == 2
+        # ...on two DIFFERENT services, not two days of one pair.
+        assert len({ns for ns, _, _ in checks}) == 2
+        assert result.ok
+        # A memo hit that was re-fetched live saved nothing; only the rest count.
+        assert result.requests_saved == 10 * days - len(calls)
+        services |= {ns for ns, _, _ in checks}
+        pairs |= {(ns, staff) for ns, staff, _ in checks}
+        check_days |= {day for _, _, day in checks}
+    # Across runs the draw covers every memo-served service, both stylists, and more than
+    # the pair's second day — the only day the old sampler could ever look at first.
+    assert services == {"s2", "s3", "s4", "s5"}
+    assert {staff for _, staff in pairs} == {NAO, SACHI}
+    assert len(check_days) >= 3
+
+
+def test_one_check_a_run_still_reaches_the_last_service_on_some_runs():
+    """With one check per run, no single run can prove every service — but the rotation
+    means the last service is reached on some runs instead of on none, ever."""
+    caught = [seed for seed in range(40)
+              if not _five_cuts(seed, budget=1, diverge={"s5"})[0].ok]
+    assert caught, "the last service was never checked on any of 40 runs"
+    assert len(caught) < 40      # a sample, not a re-fetch of everything
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_a_broken_invariant_drops_the_memo_for_the_rest_of_the_run(seed):
+    """What happens after a mismatch is unchanged by the sampler: the memo is dropped and
+    not reused, and the fetch is untrusted."""
+    days = len(_open_days())
+    result, calls = _five_cuts(seed, budget=4, diverge={"s3"})
+    assert result.ok is False
+    assert any("dedup invariant broken for Cut 3" in e for e in result.errors)
+    per_pair = Counter((ns, staff) for _, ns, staff, _ in calls)
+    for ns in ("s4", "s5"):
+        for staff in (NAO, SACHI):
+            assert per_pair[(ns, staff)] == days, f"{ns}/{staff} was served from the memo"
+
+
+def test_the_spot_check_draw_comes_from_the_injected_rng():
+    """The seam that keeps the tests above deterministic while production rotates."""
+    assert _five_cuts(7, budget=2)[1] == _five_cuts(7, budget=2)[1]
+    draws = {tuple(_spot_checks(_five_cuts(seed, budget=2)[1])) for seed in range(5)}
+    assert len(draws) > 1
+
+
+def test_production_draws_from_a_system_seeded_rng(monkeypatch):
+    """Rotation between runs rests entirely on fetch() building an UNSEEDED Random when no
+    rng is injected. Every other sampler test injects one, so `random.Random(0)` as the
+    default — a static sample in production, the bug this sampler replaced — passed them
+    all."""
+    made = []
+
+    class Spy(random.Random):
+        def __init__(self, *args):
+            made.append(args)
+            super().__init__(*args)
+
+    monkeypatch.setattr(fa.random, "Random", Spy)
+    fetch(mkconfig(lookahead_days=10, verify_dedup_samples=1), client_factory=FiveCuts)
+    assert made == [()]
+
+
+def test_production_runs_do_not_all_check_the_same_day():
+    """The same, end to end: one check a run, no rng injected. 40 equally likely draws, so
+    twelve identical runs in a row would take odds of about 1 in 10^17."""
+    draws = set()
+    for _ in range(12):
+        FakeClient.calls = []
+        FiveCuts.diverge = set()
+        fetch(mkconfig(lookahead_days=10, verify_dedup_samples=1), client_factory=FiveCuts)
+        draws.add(tuple(_spot_checks(_timeslot_calls())))
+    assert len(draws) > 1
+
+
+# FiveCuts hides the hard case: every pair there whose stylist an earlier service walked
+# IS memo-served, so a check can never be promised to a pair with no use for it. The real
+# menu is full of pairs that look just as eligible up front and never are — the stylist was
+# walked before, but never at this length — and a draft of this sampler lost every check it
+# promised one of them.
+class Menu(FakeClient):
+    """`durations` maps service_id, or (service_id, staff_id) when one stylist's length
+    differs, to minutes."""
+    durations: dict = {}
+    diverge: set = set()
+
+    def time_slots(self, staff_id, date_iso):
+        FakeClient.calls.append(("time_slots", self.ns, staff_id, date_iso))
+        FakeClient.slot_sessions.append(self.n)
+        dur = self.durations.get((self.ns, staff_id)) or self.durations[self.ns]
+        starts = (900,) if self.ns in type(self).diverge else (600, 660)
+        return [RawSlot(date=date_iso, service_id=self.ns, staff_id=staff_id,
+                        start_min=m, end_min=m + dur, token="t") for m in starts]
+
+
+def _menu_entries(names, staff_ids=(NAO,)):
+    return [{"service_id": sid, "name": name, "staff_ids": list(staff_ids),
+             "bookable_item_id": f"{sid}:SV"} for sid, name in names.items()]
+
+
+class NaoSalon(Menu):
+    """What `stylists: [Nao]` plans against the real menu (docs/timely-api.md): the nine
+    salon services in catalog order, one pair each, at their real lengths. Every one after
+    Hair Cut COULD be memo-served as far as anything knowable up front says, but only Blow
+    Out (55m, as Hair Cut), Half Head Foil and Ombre (3h, as Full Head Foil) are."""
+    durations = {"hc": 55, "blow": 55, "roots": 90, "single": 120, "full": 180,
+                 "half": 180, "two": 240, "ombre": 180, "deep": 30}
+    catalog = _menu_entries({
+        "hc": "Hair Cut", "blow": "Blow Out", "roots": "Roots Color",
+        "single": "Single Process", "full": "Full Head Foil", "half": "Half Head Foil",
+        "two": "Two+ Process", "ombre": "Ombre", "deep": "Deep Conditioner"})
+    MEMO_SERVED = {"blow", "half", "ombre"}
+
+
+class BeardShave(Menu):
+    """The real Beard Shave shape, reduced: X has one memo-served pair (Nao, at A's length)
+    and one that never is (Sachi, at a length nobody walked before) — as Fausto is
+    memo-served from Head Shave and Sachi's is her first 30-minute walk."""
+    durations = {"A": 55, "X": 55, ("X", SACHI): 85, "Y": 55}
+    catalog = (_menu_entries({"A": "Svc A", "X": "Svc X"}, (NAO, SACHI))
+               + _menu_entries({"Y": "Svc Y"}))
+    MEMO_SERVED = {"X", "Y"}
+
+
+def _menu(cls, seed, budget, diverge=()):
+    """Run `cls`; return the result and the number of live requests per pair."""
+    FakeClient.calls = []
+    cls.diverge = set(diverge)
+    result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=budget),
+                   client_factory=cls, rng=random.Random(seed))
+    return result, Counter((ns, staff) for _, ns, staff, _ in _timeslot_calls())
+
+
+def _menu_checks(cls, seed, budget):
+    """The spot-checks of a run where the memo held: requests beyond what the same plan
+    costs with checking switched off."""
+    _, floor = _menu(cls, seed, 0)
+    result, made = _menu(cls, seed, budget)
+    return result, made - floor
+
+
+@pytest.mark.parametrize("cls", [NaoSalon, BeardShave])
+def test_a_budget_covering_every_memo_served_service_checks_every_one(cls):
+    """A draft of this sampler, given the default 4 checks for `stylists: [Nao]`'s 3
+    memo-served services, checked only 2 of them on 34 runs in 50. It promised checks up
+    front to pairs that then turned out never to be memo-served, and a promise to such a
+    pair was simply lost. Here the budget is exactly the number of memo-served services:
+    on that draft, 44 of 50 NaoSalon runs and 26 of 50 BeardShave runs fell short."""
+    budget = len(cls.MEMO_SERVED)
+    short = {}
+    for seed in range(50):
+        result, checks = _menu_checks(cls, seed, budget)
+        assert result.ok
+        assert sum(checks.values()) <= budget
+        if {ns for ns, _ in checks} != cls.MEMO_SERVED:
+            short[seed] = sorted({ns for ns, _ in checks})
+    assert not short, f"{len(short)}/50 runs left a memo-served service unchecked: {short}"
+
+
+@pytest.mark.parametrize("cls, culprit", [(NaoSalon, "blow"), (NaoSalon, "ombre"),
+                                          (BeardShave, "X"), (BeardShave, "Y")])
+def test_a_diverging_service_is_caught_on_every_run_when_the_budget_covers_it(cls, culprit):
+    """The cost of the lost checks: on that draft, Blow Out alone diverging was published
+    under ok=True on 31 of these 50 runs and BeardShave's X on 26 — where the old fixed
+    sampler, for all its faults, caught both every time."""
+    missed = [seed for seed in range(50)
+              if _menu(cls, seed, len(cls.MEMO_SERVED), diverge={culprit})[0].ok]
+    assert not missed, f"{culprit} published under ok=True on runs {missed}"
+
+
+def test_with_fewer_checks_than_services_each_is_equally_likely_to_be_checked():
+    """Uniform over the memo-served services, wherever they sit in the plan and however many
+    never-memo-served pairs surround them — and the one check is always spent."""
+    counts = Counter()
+    for seed in range(300):
+        _, checks = _menu_checks(NaoSalon, seed, 1)
+        assert sum(checks.values()) == 1
+        counts.update(ns for ns, _ in checks)
+    assert set(counts) == NaoSalon.MEMO_SERVED
+    assert all(70 <= n <= 130 for n in counts.values()), counts      # 100 each expected
+
+
+def test_a_budget_covering_every_memo_served_pair_checks_every_pair():
+    for seed in range(20):
+        result, calls = _five_cuts(seed, budget=8)
+        assert result.ok
+        assert sorted((ns, staff) for ns, staff, _ in _spot_checks(calls)) == \
+            sorted((f"s{i}", staff) for i in range(2, 6) for staff in (NAO, SACHI))
+
+
+def test_a_check_made_after_the_sweep_goes_through_a_fresh_session():
+    """svcB is the only memo-served service and has two pairs, so with two checks one is
+    made as svcB's walk ends and the other has to wait for the sweep to finish. It must not
+    reuse svcB's sweep session: by then that session has sat idle for the rest of the sweep,
+    nothing in docs/timely-api.md says how long an obg session lives, and a stale one that
+    answered with a well-formed empty day would read as a broken invariant and void the
+    whole run. A new session is taken through the funnel exactly as the sweep's are."""
+    result = _fetch(verify_dedup_samples=2)
+
+    assert result.ok
+    per_pair = Counter((ns, staff) for _, ns, staff, _ in _timeslot_calls())
+    assert per_pair[("svcB", NAO)] == 2 and per_pair[("svcB", SACHI)] == 2
+    # Sessions 0-3 are the sweep's: the catalog probe, then svcA, svcB, svcC.
+    assert [ns for ns, _ in FakeClient.sessions] == ["", "svcA", "svcB", "svcC", "svcB"]
+    assert FakeClient.sessions[4][1] == ["bootstrap", "service", "staff"]
+    assert FakeClient.slot_sessions[-1] == 4
+
+
+def test_a_check_that_cannot_be_made_is_reported_not_charged_as_a_failed_lookup():
+    """A spot-check re-reads one day of a pair whose lookup already completed. If that
+    request fails, the pair is exactly as good as one the draw never picked. It used to run
+    inside the pair's lookup, so a single 429 on it threw the pair's slots away and cost the
+    stylist delete authority for the run."""
+    class CheckErrors(FakeClient):
+        def time_slots(self, staff_id, date_iso):
+            if self.ns == "svcB" and any(c[1:3] == ("svcB", staff_id)
+                                         for c in _timeslot_calls()):
+                raise RuntimeError("check exploded")      # the probe went through
+            return super().time_slots(staff_id, date_iso)
+
+    result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=2),
+                   client_factory=CheckErrors, rng=random.Random(0))
+
+    assert result.ok
+    assert result.lookups_failed == 0
+    assert result.staff_ok == {NAO, SACHI}
+    assert {s.service for s in result.slots} == {"Hair Cut", "Hair Cut Deluxe",
+                                                 "Beard Sculpt"}
+    # One made as svcB's walk ended, one after the sweep: both said so.
+    assert len([e for e in result.errors if "spot-check not made" in e]) == 2
+
+
+def test_a_session_that_will_not_open_after_the_sweep_leaves_the_run_trusted():
+    FakeClient.fail_sessions = {4}          # the first session opened after the sweep
+    result = _fetch(verify_dedup_samples=2)
+
+    assert result.ok
+    assert result.lookups_failed == 0 and result.staff_ok == {NAO, SACHI}
+    assert any("spot-check not made" in e for e in result.errors)
+
+
+def test_a_throttle_after_the_sweep_stops_the_checks_but_does_not_abort_the_run():
+    """Every lookup has landed by then. BudgetExhausted says stop sending, and we do — no
+    further session is opened — but it says nothing about data already complete."""
+    FakeClient.budget_error_sessions = {6}  # FiveCuts' sweep is sessions 0-5
+    result, _ = _five_cuts(0, budget=8)     # 4 checks in-session, 4 left for afterwards
+
+    assert result.ok
+    assert not any("run aborted" in e for e in result.errors)
+    assert any("spot-checks stopped" in e for e in result.errors)
+    assert len(FakeClient.sessions) == 7
+
+
+def test_a_throttle_on_an_in_sweep_check_still_aborts_the_sweep():
+    """Unlike a check after the sweep, this one has services still to walk."""
+    class ThrottledCheck(FiveCuts):
+        def time_slots(self, staff_id, date_iso):
+            if self.ns == "s2" and date_iso != _open_days()[0]:
+                # s2 is memo-served: past its probe day, every request it makes is a check.
+                raise BudgetExhausted("cap reached")
+            return super().time_slots(staff_id, date_iso)
+
+    FiveCuts.diverge = set()
+    result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=4),
+                   client_factory=ThrottledCheck, rng=random.Random(0))
+
+    assert result.ok is False
+    assert any("run aborted" in e for e in result.errors)
+    assert result.staff_ok == set()
+    assert not any(c[1] in ("s3", "s4", "s5") for c in _timeslot_calls())
 
 
 # --------------------------------------------------------------- health threshold
@@ -653,6 +1017,100 @@ def test_staff_ok_excludes_a_stylist_with_any_failed_lookup():
     assert NAO not in result.staff_ok       # one failure withdraws delete authority
 
 
+# ------------------------------------------------- who was looked for, and over what window
+MASA = "287218"                  # in the catalog, but in no FakeClient service
+
+# 02:00 UTC on Oct 13 is still 22:00 EDT on Oct 12: one of the four or five hours a day
+# when New York's date and a UTC host's (a GitHub Actions runner's) are different days.
+# Outside those hours "today" read from the host's clock is the right answer by accident,
+# which is how a host-date window_start would sail through CI most of the time.
+_FROZEN = datetime(2026, 10, 13, 2, 0, tzinfo=timezone.utc)
+NY_TODAY = date(2026, 10, 12)
+
+
+class _UtcHostDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        # A naive now() is the host's wall clock: a UTC runner's.
+        return _FROZEN.astimezone(tz) if tz else _FROZEN.replace(tzinfo=None)
+
+
+class _UtcHostDate(date):
+    @classmethod
+    def today(cls):
+        return _FROZEN.date()
+
+
+@pytest.fixture
+def ny_evening(monkeypatch):
+    """Freeze fetch()'s clock at _FROZEN, on a UTC host."""
+    monkeypatch.setattr(fa, "datetime", _UtcHostDatetime)
+    monkeypatch.setattr(fa, "date", _UtcHostDate)
+
+
+def _uncovered(result, stylist):
+    """The sync's delete-authority rule, as the shared interface defines it: True means
+    this stylist's entries are withheld (no deletes, no writes) this run."""
+    if result.staff_ok is None:
+        return False
+    if result.staff_planned is not None:
+        return stylist in result.staff_planned - result.staff_ok
+    return stylist not in result.staff_ok          # legacy rule: planned set unknown
+
+
+def test_staff_planned_is_everyone_the_plan_looked_for(ny_evening):
+    """A stylist we looked for and could not see must keep their entries; one we never
+    looked for (left the salon, dropped from the catalog, filtered out) has ordinary stale
+    entries. staff_ok alone cannot tell those apart — both are simply absent from it."""
+    FakeClient.fail_staff_for = {("svcC", NAO)}
+    result = _fetch()
+
+    assert result.staff_planned == {NAO, SACHI}
+    assert _uncovered(result, NAO)                 # planned, failed: withheld
+    assert not _uncovered(result, SACHI)           # planned, seen: deletable
+    assert not _uncovered(result, MASA)            # never planned: covered by absence
+    # The window the fetch actually walked, so the sync judges staleness against it — New
+    # York's date, not the host's, which is already the 13th.
+    assert result.window_start == NY_TODAY
+
+
+def test_a_stylist_filtered_out_by_config_is_not_planned():
+    result = _fetch(stylists=["Nao"])
+    assert result.staff_planned == {NAO}
+    assert not _uncovered(result, SACHI)
+
+
+@pytest.mark.parametrize("abort_at", ["svcA", "svcB", "svcC"])
+def test_an_aborted_sweep_still_reports_the_whole_plan(abort_at):
+    """staff_planned - staff_ok is who the sync withholds. Shrinking staff_planned to the
+    stylists the sweep reached would hand everyone it never reached their deletes back.
+
+    Aborting at svcA is the case that can tell: nobody has been reached. svcA walks both
+    stylists, so from svcB on "reached" and "planned" are the same set."""
+    FakeClient.budget_error_setup_for = {abort_at}
+    result = _fetch()
+
+    assert result.ok is False
+    assert result.staff_ok == set()
+    assert result.staff_planned == {NAO, SACHI}
+    assert _uncovered(result, NAO) and _uncovered(result, SACHI)
+    assert result.window_start is not None
+
+
+def test_a_throttled_bootstrap_reports_no_plan_rather_than_an_empty_one(ny_evening):
+    """No plan existed, so the honest value is None ('unknown'), and it is also the only
+    safe one: an EMPTY staff_planned would make staff_planned - staff_ok empty, i.e. every
+    stylist on the calendar 'never looked for' and every entry deletable — on the one run
+    that saw nothing at all. None falls back to the legacy rule, which withholds everyone."""
+    FakeClient.budget_error_setup_for = {""}       # the catalog probe's namespace
+    result = _fetch()
+
+    assert result.staff_ok == set()
+    assert result.staff_planned is None
+    assert all(_uncovered(result, sid) for sid in STAFF)
+    assert result.window_start == NY_TODAY
+
+
 def test_open_dates_shape_change_is_an_error_not_silence():
     """A missing 'openDates' key would otherwise read as 'no open days', skipping every
     gettimeslots call so the strict slot parser never even runs."""
@@ -700,6 +1158,23 @@ def test_unknown_staff_are_skipped_not_published_as_placeholders():
 def test_stylist_filter_narrows_the_plan():
     result = _fetch(stylists=["Nao"])
     assert {s.stylist for s in result.slots} == {"Nao"}
+
+
+def test_a_single_stylist_name_is_one_name_not_its_letters():
+    """`stylists: Nao` was iterated letter by letter, and Sachi has an 'a' — so was every
+    one of the nine stylists. mkconfig validates, as Config.load does, so this is the
+    config production would actually run with."""
+    result = _fetch(stylists="Nao")
+    assert {s.stylist for s in result.slots} == {"Nao"}
+    assert result.staff_planned == {NAO}
+
+
+def test_the_filters_never_iterate_a_bare_string_by_letter():
+    """Belt and braces for a Config that never went through validate()."""
+    assert _stylist_allowed(NAO, "Nao")
+    assert not _stylist_allowed(SACHI, "Nao")
+    assert not _service_allowed("Hair Cut", "Buzz")    # "Buzz" shares only a 'u' with it
+    assert _service_allowed("Buzz", "Buzz")
 
 
 def test_min_slot_hour_filter():

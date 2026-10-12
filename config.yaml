@@ -2,14 +2,23 @@
 # See docs/timely-api.md for service/staff ids.
 # Unknown keys are warned about and ignored; invalid values fail the run at startup.
 
-# Deep-sweep window, and the shorter window most hourly runs use. The program picks
-# between them itself (--depth auto): it goes deep whenever the last deep sweep is older
-# than deep_sweep_every_hours, read off a marker event on the calendar. It does NOT derive
-# the choice from the wall clock — GitHub delivered only 56% of this repo's hourly cron
-# ticks over a measured 180-hour window, and 00:00 UTC never fired once.
+# Deep-sweep window, and the shorter window the runs between deep sweeps use. The program
+# picks between them itself (--depth auto): it goes deep whenever the last deep sweep is
+# older than deep_sweep_every_hours, read off a marker event on the calendar. It does NOT
+# derive the choice from the wall clock — GitHub delivered only 56% of this repo's hourly
+# cron ticks over a measured 180-hour window, and 00:00 UTC never fired once; since late
+# Sep 2026 it has delivered only ~4 runs a day, so runs are often far enough apart that
+# the run after a deep sweep is due another one.
 lookahead_days: 90
 near_lookahead_days: 21
 deep_sweep_every_hours: 6
+
+# Must be America/New_York; anything else fails the run at startup. It is not a display
+# preference: every Timely request is sent with tzId=80 (New York, src/timely.py) and
+# Timely answers in KIDA's New York wall-clock minutes, which are stamped with this zone.
+# Any other zone — even a perfectly valid one like Europe/London — would silently shift
+# every published opening by the difference between the two, so it is refused rather
+# than honoured.
 timezone: America/New_York
 
 # How openings are rendered on the calendar.
@@ -31,15 +40,27 @@ timezone: America/New_York
 # next 21 days and leave 22-90 out as slots until the next deep sweep.
 event_style: blocks
 
-# Which stylists to include. Use "all" or a list of names (case-insensitive).
-# Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto (master barbers) · Hiroki (junior)
-# Staff not listed in src/catalog.py STAFF are skipped rather than published as "Staff 12345".
+# Which stylists to include: "all", a list of names, or a single name. Names match
+# case-insensitively as part of a name in src/catalog.py STAFF; one that matches nobody is
+# a startup error, since it can only be a typo.
+# Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto, Shin (master
+# barbers) · Hiroki (junior barber).
+# Leaving someone out does more than hide future openings: a stylist the run never looks
+# for is treated like one who has left the salon, so their existing entries are deleted on
+# the next run (still under the global mass-delete guard).
+# Staff Timely lists who are not in src/catalog.py STAFF are warned about every run and
+# skipped rather than published as "Staff 12345" — e.g. id 709526, seen once on
+# 2026-10-03 — until someone adds them there.
 stylists: all
 
-# Service allowlist by NAME (case-insensitive substring), or "all" for every online
-# service (cuts, color, highlights, blowout, beard work, deep conditioner, …).
-# Phone-only services (kids haircut / bang trim / keratin) never appear in the online
-# funnel at all, so there is nothing to exclude.
+# Service allowlist by NAME (case-insensitive substring), "all" for every online service
+# (cuts, color, highlights, blowout, beard work, deep conditioner, …), or a single name.
+# There is no exclude syntax: to drop a service, list the ones you want instead.
+# What is online changes. This comment used to say phone-only services (kids haircut,
+# bang trim, keratin) never appear in the online funnel; then "Kids Hair Cut" (id 5319849)
+# appeared there on 2026-10-03, so "all" can now include it. A service id missing from
+# src/catalog.py SERVICES is warned about every run ("unknown service id …") and still
+# published, just without a category or price, until someone adds it there.
 services: all
 
 min_slot_hour: null          # e.g. 18 to only show evening slots (local hour, 0-23)
@@ -51,8 +72,10 @@ max_requests_per_run: 6000   # 90-day × all services × all staff, with headroo
 cache_ttl_seconds: 900       # DEV ONLY: CI sets KIDA_CACHE_TTL_SECONDS=0 (it can never hit there)
 
 # A gettimeslots response depends on (staff, date, service duration), not on which service
-# is selected, so identical lookups are served from an in-run memo. This many memo hits per
-# run are re-fetched and compared anyway, so we find out if that ever stops being true.
+# is selected, so identical lookups are served from an in-run memo. Up to this many memo
+# hits per run are re-fetched and compared anyway — spread over as many different services
+# as possible and re-drawn at random every run — so we find out if that ever stops being
+# true. 0 turns the checks off; it must be a whole number.
 verify_dedup_samples: 4
 
 # Google Calendar (live API path). With service-account auth the calendar id is REQUIRED

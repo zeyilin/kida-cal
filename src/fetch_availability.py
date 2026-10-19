@@ -434,24 +434,36 @@ def _check_not_made(svc: dict, staff_id: str, day: str, e: Exception) -> str:
     return msg
 
 
+def _checks_stopped(e: BudgetExhausted, when: str) -> str:
+    msg = f"dedup spot-checks stopped {when}: {e}"
+    print(f"::warning::{msg}", file=sys.stderr)
+    return msg
+
+
 def _make_up_checks(plan, sampler: _DedupSampler, make_client, cache,
                     service_staff_ids: dict, errors: list[str]) -> tuple[int, bool]:
     """Spend the checks still unspent when the sweep ends (see _DedupSampler). Returns
     (checks made, whether one found the invariant broken).
 
-    Each goes through a NEW session, taken through the funnel exactly as the sweep's are —
-    never the service's own sweep session. By now that one has sat idle for the rest of the
-    sweep, nothing in docs/timely-api.md says how long an obg session lives, and a stale
-    session that answered with a well-formed empty day would read here as a broken invariant
-    and void the whole run. The price is a session's three setup requests (two of them the
-    funnel POSTs) per service checked here: at most 12 with the default 4 checks, against a
-    ~2,300-request sweep. Simulated against the real menu (docs/timely-api.md), about half
-    of all runs need one such session and a few need two.
+    Each goes through a NEW session — never the service's own sweep session. By now that one
+    has sat idle for the rest of the sweep, nothing in docs/timely-api.md says how long an
+    obg session lives, and a stale session that answered with a well-formed empty day would
+    read here as a broken invariant and void the whole run. The new session makes the
+    sweep's requests in the sweep's order: the funnel, then GetOpenDates for the stylist
+    (the check day's month only), then gettimeslots. Skipping GetOpenDates would save a GET
+    but ask gettimeslots in an order no sweep, browser or recon capture has ever used, and
+    an empty day earned that way would void the run just the same. The price is a session's
+    three setup requests (two of them the funnel POSTs) per service checked here, and one
+    GetOpenDates per check: at most 16 with the default 4 checks, against a ~2,300-request
+    sweep. Simulated against the real menu (docs/timely-api.md), about half of all runs need
+    one such session and a few need two.
 
     Every lookup is complete by now, so nothing here can fail one. A check that cannot be
     made is reported and its pair stays unverified, like any pair the draw passed over. A
     throttle (BudgetExhausted) stops the checks — it means stop sending — but does not
-    abort the run: it says nothing about data that is already complete.
+    abort the run: it says nothing about data that is already complete. (The last planned
+    service's own check, made inside the sweep but with nothing left to walk, is treated
+    the same way; see fetch().)
     """
     sessions: dict[int, object] = {}
     dead: set[int] = set()            # services whose make-up session failed: not retried
@@ -471,11 +483,13 @@ def _make_up_checks(plan, sampler: _DedupSampler, make_client, cache,
                 client.select_service(svc["bookable_item_id"], service_staff_ids)
                 client.select_staff(staff_id)
                 sessions[idx] = client
+            # The answer is not used: the request is made for the order's sake (see above).
+            # Each check in a session is a different stylist, so it is never asked twice.
+            checked = datetime.fromisoformat(day)
+            client.open_dates(staff_id, checked.month, checked.year)
             live = client.time_slots(staff_id, day)
         except BudgetExhausted as e:
-            msg = f"dedup spot-checks stopped after the sweep: {e}"
-            print(f"::warning::{msg}", file=sys.stderr)
-            errors.append(msg)
+            errors.append(_checks_stopped(e, "after the sweep"))
             break
         except Exception as e:
             errors.append(_check_not_made(svc, staff_id, day, e))
@@ -585,6 +599,9 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
     # NOT folded into fail_count: the rest of the window was never looked at, so the only
     # honest verdict for the whole run is untrusted, whatever the ratio of what we did see.
     aborted: str | None = None
+    # Set when a stop condition trips on a spot-check once nothing is left to walk: no more
+    # requests this run, but the sweep's data stands (see the last service's check below).
+    checks_stopped = False
 
     for idx, (svc, eligible) in enumerate(plan):
         meta = service_meta(svc["service_id"])
@@ -701,11 +718,20 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
             try:
                 fresh = client.time_slots(staff_id, day)
             except BudgetExhausted as e:
-                # A stop condition mid-sweep, like any other: the run is over, and whatever
-                # services follow this one go unwalked.
-                aborted = str(e)
-                errors.append(f"run aborted: {e}")
-                break
+                if idx < len(plan) - 1:
+                    # A stop condition mid-sweep, like any other: the run is over, and
+                    # whatever services follow this one go unwalked.
+                    aborted = str(e)
+                    errors.append(f"run aborted: {e}")
+                    break
+                # The last service: nothing is left to walk, so this is a throttle after
+                # the sweep in all but name, and is treated as one (see _make_up_checks).
+                # Stop sending — no make-up session follows — but keep data that is
+                # already complete. Aborting here used to void runs whose every lookup had
+                # landed (exit 2, nothing written) over a request that only re-read a day
+                # already published, while the same throttle one session later did not.
+                errors.append(_checks_stopped(e, "as the sweep ended"))
+                checks_stopped = True
             except Exception as e:
                 # Not a failed lookup: the pair's own lookup already completed, and this
                 # request only re-reads one of its days. It used to run inside that lookup,
@@ -728,9 +754,9 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
 
     # Checks promised to services that turned out never to be memo-served are not lost:
     # they go to the memo-served services that were passed over (see _DedupSampler). Not
-    # on an aborted run, which is mid-back-off and untrusted anyway, nor once the memo has
-    # already been caught out.
-    if not aborted and memo_trusted and sampler.left:
+    # on an aborted run, which is mid-back-off and untrusted anyway, nor after a stop
+    # condition on the last service's check, nor once the memo has already been caught out.
+    if not aborted and not checks_stopped and memo_trusted and sampler.left:
         made, broken = _make_up_checks(plan, sampler, make_client, cache,
                                        service_staff_ids, errors)
         saved -= made

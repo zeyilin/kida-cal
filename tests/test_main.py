@@ -622,3 +622,105 @@ def test_a_replay_is_judged_against_the_window_it_was_captured_in(rig):
     sync_calendar.main(["--depth", "near", "--from-json", str(cap)])
 
     assert body["id"] in rig["service"].live()
+
+
+# --------------------------------------------------------------- a deep sweep that keeps failing
+def _tick(rig, monkeypatch, at, *argv):
+    """One scheduled run at `at`, as the workflow would start it. A fresh Config per run:
+    main() overwrites lookahead_days with the tier it resolved, and Config.load hands back
+    the rig's one object, so reusing it would shrink every later deep window to 21 days."""
+    rig["config"] = mkconfig()
+    _freeze(monkeypatch, at)
+    try:
+        sync_calendar.main(list(argv) or ["--skip-if-checked-within", "50"])
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+def test_a_deep_sweep_that_keeps_failing_does_not_starve_the_near_window(
+        rig, monkeypatch, gh_out):
+    """Only a clean deep sweep records itself, so auto picked deep again after every failed
+    one. Under a throttle that aborts a ~1575-request deep sweep but spares a ~240-request
+    near one, no near sweep ever ran: days 0-21 went unrefreshed and every run exited 2.
+    Now a failed deep attempt hands the next run to near, and deep is retried after it."""
+    _seed_marker(rig, last_attempt=NOW - timedelta(hours=2), last_run=NOW - timedelta(hours=2),
+                 last_deep_sweep=NOW - timedelta(hours=7))
+    deep_days = mkconfig().lookahead_days
+    depths = []
+
+    def on_fetch():
+        deep = rig["config"].lookahead_days == deep_days
+        depths.append(deep)
+        rig["result"] = _result([], ok=False) if deep else _result(_openings(hour=10))
+    rig["on_fetch"] = on_fetch
+
+    codes = [_tick(rig, monkeypatch, NOW + timedelta(hours=h)) for h in range(4)]
+
+    assert depths == [True, False, True, False]
+    assert codes == [2, 0, 2, 0]
+    private = rig["service"].live()[MARKER_ID]["extendedProperties"]["private"]
+    # The near run's own marker keeps the deep attempt before it, and no deep sweep is
+    # claimed for either failed one.
+    assert private["last_deep_attempt"] == (NOW + timedelta(hours=2)).isoformat()
+    assert private["last_deep_sweep"] == (NOW - timedelta(hours=7)).isoformat()
+
+
+def test_a_clean_deep_sweep_leaves_auto_on_its_normal_schedule(rig, monkeypatch, gh_out):
+    _seed_marker(rig, last_attempt=NOW - timedelta(hours=2),
+                 last_deep_sweep=NOW - timedelta(hours=7))
+    deep_days = mkconfig().lookahead_days
+    depths = []
+    rig["on_fetch"] = lambda: depths.append(rig["config"].lookahead_days == deep_days)
+    rig["result"] = _result(_openings(hour=10))
+
+    codes = [_tick(rig, monkeypatch, NOW + timedelta(hours=h)) for h in range(3)]
+
+    assert codes == [0, 0, 0]
+    assert depths == [True, False, False]
+
+
+def test_a_near_capture_replayed_as_full_leaves_no_deep_attempt_behind(rig, monkeypatch, gh_out):
+    """It is not a deep sweep (see the .ics test above), so the next auto run must not
+    read it as a deep sweep that failed and put the real one off."""
+    _freeze(monkeypatch)
+    _seed_marker(rig, last_attempt=NOW - timedelta(hours=2))
+    cap = rig["tmp"] / "cap.json"
+    cap.write_text(sync_calendar.result_to_json(_result(_openings()), lookahead_days=21))
+
+    sync_calendar.main(["--depth", "full", "--from-json", str(cap)])
+
+    private = rig["service"].live()[MARKER_ID]["extendedProperties"]["private"]
+    assert "last_deep_attempt" not in private
+    assert sync_calendar.resolve_depth(mkconfig(), "auto", rig["service"].live()[MARKER_ID],
+                                       now=NOW)[1] is True
+
+
+def test_a_stylist_whose_blocks_keep_shrinking_unseen_fails_the_run(rig, monkeypatch, gh_out):
+    """End to end: withheld shrinking patches count toward the skipped-delete floor, so a
+    stylist uncovered on every run, with booked openings still advertised mid-block, no
+    longer exits 0 run after run with the heartbeat green."""
+    _freeze(monkeypatch)
+    cfg = rig["config"] = mkconfig(event_style="blocks")
+    days = range(1, 13)
+    held = []
+    for d in days:
+        (block,) = sync_calendar.build_entries(_openings(n=5, stylist="sick", days_ahead=d,
+                                                         hour=10), "blocks")
+        body = sync_calendar.entry_body(block, cfg, "")
+        rig["service"].store[body["id"]] = dict(body, status="confirmed")
+        held.append(body["id"])
+    # 12:00 booked every day: each head keeps its id and would shrink 5 -> 2.
+    feed = [ev for d in days
+            for ev in _openings(n=5, stylist="sick", days_ahead=d, hour=10)
+            if ev.start.hour != 12]
+    rig["result"] = _result(feed + _openings(stylist="175308", hour=10), staff_ok={"175308"})
+    rig["result"].staff_planned = {"175308", "sick"}
+
+    with pytest.raises(SystemExit) as ei:
+        sync_calendar.main(["--depth", "near"])
+
+    assert ei.value.code == 1
+    touched = {e for m, e in rig["service"].calls if m in ("patch", "delete", "update")}
+    assert touched.isdisjoint(held)
+    assert all(rig["service"].live()[i]["summary"] == "Nao · 5 open" for i in held)

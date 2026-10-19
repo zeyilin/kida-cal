@@ -27,6 +27,7 @@ import pytest
 import yaml
 
 from src import sync_calendar
+from src.models import MARKER_ID
 # The end-to-end section drives main() on test_main's rig; importing the fixtures is what
 # makes them available here.
 from test_main import (NOW, _freeze, _openings, _outputs, _result, _seed_marker,
@@ -136,16 +137,35 @@ def test_schedule_gives_four_independent_chances_an_hour():
         "8 * * * *", "23 * * * *", "38 * * * *", "53 * * * *"]
 
 
+def _program_argv(calls: str) -> list[str]:
+    """The argv the stubbed `python` received from the sync step, after `-m <module>`."""
+    argv = calls.split("CALL python\n", 1)[1].splitlines()
+    assert argv[:2] == ["-m", "src.sync_calendar"]
+    return argv[2:]
+
+
 def test_every_run_passes_the_50_minute_freshness_gate(tmp_path):
     """Without the gate, four ticks an hour would mean up to four Timely sweeps an hour.
     Run the real sync step and look at the argv the program actually receives."""
-    proc, calls, _ = _run("Sync calendar", tmp_path, DEPTH="auto")
+    proc, calls, _ = _run("Sync calendar", tmp_path, DEPTH="auto", GITHUB_RUN_ATTEMPT="1")
     assert proc.returncode == 0, proc.stderr
-    argv = calls.split("CALL python\n", 1)[1].splitlines()
-    assert argv[:2] == ["-m", "src.sync_calendar"]
+    argv = _program_argv(calls)
     i = argv.index("--skip-if-checked-within")
     assert argv[i + 1] == "50"
     assert argv[argv.index("--depth") + 1] == "auto"
+
+
+@pytest.mark.parametrize("attempt", ["2", "3"])
+def test_a_rerun_is_not_gated(tmp_path, attempt):
+    """'Re-run jobs' reuses the original run's event, so re-running a failed scheduled run
+    is depth auto again. Gated, it read the failed attempt's own start stamp and became a
+    green no-op: no Timely request, the calendar still stale, the failure issue still open.
+    GitHub never re-runs by itself, so attempt > 1 is a person asking, like near/full."""
+    proc, calls, _ = _run("Sync calendar", tmp_path, DEPTH="auto", GITHUB_RUN_ATTEMPT=attempt)
+    assert proc.returncode == 0, proc.stderr
+    argv = _program_argv(calls)
+    assert argv[argv.index("--skip-if-checked-within") + 1] == "0"
+    assert f"Re-run (attempt {attempt})" in proc.stdout
 
 
 def test_workflow_level_concurrency_group_is_kept():
@@ -211,10 +231,11 @@ def test_run_summary_for_a_real_run_does_not_claim_a_skip(tmp_path):
 
 # ------------------------------------------------------------------ failure reporting
 
-def _report(tmp_path, *, age: str, open_issue: str = "", status: str = "failure"):
+def _report(tmp_path, *, age: str, open_issue: str = "", status: str = "failure",
+            exit_code: str = "1", skipped: str = "false"):
     return _run("Report failure", tmp_path, GH_TOKEN="x", JOB_STATUS=status,
-                RUN_URL="https://example.invalid/run/1", EXIT_CODE="1",
-                LAST_OK_AGE=age, FAKE_OPEN_ISSUE=open_issue)
+                RUN_URL="https://example.invalid/run/1", EXIT_CODE=exit_code,
+                SKIPPED=skipped, LAST_OK_AGE=age, FAKE_OPEN_ISSUE=open_issue)
 
 
 @pytest.mark.parametrize("age", ["0.4", "3.5", "11.9"])
@@ -239,7 +260,8 @@ def test_stale_calendar_opens_an_issue(tmp_path, age):
 
 def test_unknown_age_is_loud(tmp_path):
     """No age means the run died before it could even read the marker — a missing secret,
-    a revoked key, Google down. Never a Timely blip; open the issue."""
+    a revoked key, Google down — or the marker records no success at all. Never a passing
+    Timely blip; open the issue."""
     proc, calls, _ = _report(tmp_path, age="")
     assert proc.returncode == 0, proc.stderr
     assert "CALL gh\nissue\ncreate" in calls
@@ -260,6 +282,37 @@ def test_cancelled_run_goes_through_the_same_rule(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "CALL gh\nissue\ncreate" not in calls
     assert "::warning::" in proc.stdout
+
+
+@pytest.mark.parametrize("age", ["13.0", "40.0", ""])
+def test_a_step_failing_after_a_successful_sync_never_opens_an_issue(tmp_path, age):
+    """The age is measured BEFORE the sweep. A run that synced fine after a 13h delivery gap
+    (or the very first good run of a new setup: age unknown) and then lost an artifact
+    upload used to open 'sync-open-slots is failing' about a calendar it had just refreshed."""
+    proc, calls, _ = _report(tmp_path, age=age, exit_code="0", skipped="false")
+    assert proc.returncode == 0, proc.stderr
+    assert "CALL gh\nissue\ncreate" not in calls
+    assert "::warning::The sync itself succeeded" in proc.stdout
+    assert "Transient failure" not in proc.stdout     # nor a made-up age in the warning
+
+
+def test_a_step_failing_after_a_successful_sync_still_lands_on_an_open_issue(tmp_path):
+    """One issue per streak, as for any failure — but the comment must not call a calendar
+    this run just refreshed 13h stale."""
+    proc, calls, _ = _report(tmp_path, age="13.0", exit_code="0", skipped="false",
+                             open_issue="7")
+    assert proc.returncode == 0, proc.stderr
+    assert "CALL gh\nissue\ncomment\n7\n" in calls
+    assert "last successful sync: this run" in calls
+    assert "13.0 h" not in calls
+
+
+def test_a_skipped_tick_that_fails_later_still_gets_the_age_rule(tmp_path):
+    """A skip also exits 0, but it refreshed nothing: the age is the calendar's real age."""
+    proc, calls, _ = _report(tmp_path, age="13.0", exit_code="0", skipped="true")
+    assert proc.returncode == 0, proc.stderr
+    assert "CALL gh\nissue\ncreate" in calls
+    assert "last successful sync: 13.0 h" in calls
 
 
 # ------------------------------------------------------------------ heartbeat
@@ -428,3 +481,99 @@ def test_a_skip_pings_only_while_the_last_success_is_under_the_gate_window(
     assert failing_run_then_skip(NOW, "first") == ("0.6", True)
     # The outage goes on. An hour later A's result is 97 minutes old, and nothing pings.
     assert failing_run_then_skip(NOW + timedelta(hours=1), "second") == ("1.6", False)
+
+
+def test_rerunning_a_failed_scheduled_run_syncs_instead_of_skipping(
+        rig, monkeypatch, gh_out, tmp_path):
+    """The owner sees a red scheduled run and clicks 'Re-run all jobs' ten minutes later.
+    The re-run's argv comes from the real step (attempt 2, same schedule event, so depth
+    auto). Before the fix the program read the failed attempt's start stamp, skipped, and
+    the re-run went green having done nothing — the calendar stale and the issue open."""
+    _seed_marker(rig, last_run=NOW - timedelta(hours=3),
+                 last_attempt=NOW - timedelta(hours=3),
+                 last_deep_sweep=NOW - timedelta(hours=1))
+    rig["result"] = _result(_openings(), ok=False)           # attempt 1: a Timely blip
+    code, out = _main(monkeypatch, gh_out, NOW)
+    assert (code, out["skipped"]) == (2, "false")
+
+    rig["result"] = _result(_openings())                     # the blip is over
+    d = _step_dir(tmp_path, "rerun")
+    proc, calls, _ = _run("Sync calendar", d, DEPTH="auto", GITHUB_RUN_ATTEMPT="2")
+    assert proc.returncode == 0, proc.stderr
+    monkeypatch.chdir(d)            # the step's relative --ics / --fetch-json paths
+    _freeze(monkeypatch, NOW + timedelta(minutes=10))
+    gh_out.write_text("", encoding="utf-8")
+    sync_calendar.main(_program_argv(calls))                 # exits 0: no SystemExit
+    out = _outputs(gh_out)
+
+    assert out["skipped"] == "false"
+    assert rig["fetches"] == 2
+    assert out["last_success_age_hours"] == "3.2"            # measured before this sweep
+    # ...and this run, not a later one, closes the failure issue.
+    assert _when(_step("Clear failure issue on recovery").get("if"), status="success",
+                 outputs={**out, "exit-code": "0"})
+
+
+def test_a_run_that_syncs_after_a_long_gap_then_fails_a_later_step_opens_no_issue(
+        rig, monkeypatch, gh_out, tmp_path):
+    """GitHub delivered nothing for 13h; the next run syncs cleanly (exit 0) and then an
+    artifact upload fails. main() published the age it found BEFORE the sweep — 13.0 — and
+    Report failure used to open 'sync-open-slots is failing' off it."""
+    _seed_marker(rig, last_run=NOW - timedelta(hours=13),
+                 last_attempt=NOW - timedelta(hours=13),
+                 last_deep_sweep=NOW - timedelta(hours=1))
+    rig["result"] = _result(_openings())
+    code, out = _main(monkeypatch, gh_out, NOW)
+    assert (code, out["skipped"], out["last_success_age_hours"]) == (0, "false", "13.0")
+
+    assert _when(_step("Report failure").get("if"), status="failure",
+                 outputs={**out, "exit-code": "0"})
+    proc, calls, _ = _run("Report failure", _step_dir(tmp_path, "report"), GH_TOKEN="x",
+                          JOB_STATUS="failure", RUN_URL="u", EXIT_CODE=str(code),
+                          SKIPPED=out["skipped"], LAST_OK_AGE=out["last_success_age_hours"])
+    assert proc.returncode == 0, proc.stderr
+    assert "CALL gh\nissue\ncreate" not in calls
+    assert "::warning::The sync itself succeeded" in proc.stdout
+
+
+def test_a_new_calendar_whose_runs_all_fail_says_why_the_age_is_unknown(
+        rig, monkeypatch, gh_out, tmp_path):
+    """A new setup's first run exits 1 and creates the status marker with no success on it.
+    The next failing run reads that marker and still publishes an unknown age. The issue
+    used to blame 'failed before it could read the calendar's status marker, or there is no
+    marker yet' — both false here — and send the owner hunting for a credentials problem."""
+    _hold_deletes_for_a_stylist_we_cannot_see(rig)
+    code, _ = _main(monkeypatch, gh_out, NOW)
+    assert code == 1
+    assert MARKER_ID in rig["service"].live()                # the marker now exists...
+
+    code, out = _main(monkeypatch, gh_out, NOW + timedelta(hours=6))
+    assert (code, out["last_success_age_hours"]) == (1, "")  # ...and was read: still unknown
+    proc, calls, _ = _run("Report failure", _step_dir(tmp_path, "report"), GH_TOKEN="x",
+                          JOB_STATUS="failure", RUN_URL="u", EXIT_CODE=str(code),
+                          SKIPPED=out["skipped"], LAST_OK_AGE="")
+    assert proc.returncode == 0, proc.stderr
+    assert "CALL gh\nissue\ncreate" in calls
+    assert "no successful sync is recorded on the calendar's status marker" in calls
+    assert "none of its runs has succeeded" in calls
+
+
+def test_the_outputs_the_steps_read_are_the_ones_the_program_publishes(
+        rig, monkeypatch, gh_out):
+    """The sync step's comment lists what main() writes to GITHUB_OUTPUT and when: two
+    before Timely is contacted (so they survive a fetch that dies), `deep` after. Every
+    steps.sync.outputs.X the workflow reads must be one of those or the step's own
+    exit-code — a name that drifts reads as '' and silently flips a step's decision."""
+    _seed_marker(rig, last_run=NOW - timedelta(hours=2),
+                 last_attempt=NOW - timedelta(hours=2),
+                 last_deep_sweep=NOW - timedelta(hours=1))
+    rig["result"] = _result(_openings())
+    at_fetch = {}
+    rig["on_fetch"] = lambda: at_fetch.update(_outputs(gh_out))
+    code, out = _main(monkeypatch, gh_out, NOW)
+    assert code == 0
+    assert set(at_fetch) == {"skipped", "last_success_age_hours"}
+    assert set(out) == {"skipped", "last_success_age_hours", "deep"}
+
+    read = set(re.findall(r"steps\.sync\.outputs\.([\w-]+)", WORKFLOW.read_text("utf-8")))
+    assert read <= set(out) | {"exit-code"}, read - set(out)

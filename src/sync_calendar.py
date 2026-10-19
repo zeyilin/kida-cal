@@ -17,7 +17,7 @@ four kinds, because they need opposite orderings:
             booking or passing it re-keys the whole block)   replacement has landed
 
 Only a block can be a re-key. A `slots` id IS its opening (stylist + start), so nothing in
-the feed ever stands in for a stale slot — it is booked or history, even when an open
+the feed ever stands in for a stale slot — it is booked, held or history, even when an open
 neighbour on Timely's 30-minute grid overlaps its 55 minutes.
 
 An entry still in the feed under the same id is patched when its content changed. One kind
@@ -35,7 +35,8 @@ The passes then run in this order:
   4. narrowing patches, then     their availability IS still in the feed under another id;
      delete re-keys              shrinking or removing them before that entry is live
                                  would leave it advertised nowhere if its write failed, so
-                                 each waits for EVERY overlapping entry to land
+                                 each waits for EVERY overlapping entry to land (narrowing
+                                 latest first, as each waits only on later entries)
   5. changeover purge            entries written under the other event_style, entry by
                                  entry under the same rule as 4, and refused outright if
                                  the openings that landed are implausibly few
@@ -60,10 +61,14 @@ Safety
 * If the fetch did not clearly succeed (FetchResult.ok is False) we SKIP every delete, and
   main() refuses to write at all, so a transient Timely outage cannot wipe the calendar.
 * Delete authority is per stylist. One we LOOKED FOR and could not see completely
-  (in FetchResult.staff_planned but not staff_ok) is left exactly as they are: no delete,
-  no patch, no insert. One we never looked for (left the salon, dropped from Timely's
-  catalog, excluded by config) has nothing a failed lookup could have hidden, so their
-  entries are ordinary stale entries.
+  (in FetchResult.staff_planned but not staff_ok) is left as they are apart from entries
+  that have already ended: no delete of anything current, no patch, no insert. What that
+  withholds from deletion — their stale entries, and any block the partial view would
+  shrink — counts toward skipped_delete and main()'s exit floor. One we never looked for
+  (left the salon, dropped from Timely's catalog, excluded by config) has nothing a failed
+  lookup could have hidden, so their entries are ordinary stale entries.
+* Descriptions are rewritten only for stylists every one of whose lookups landed: a
+  failed lookup means a service's times are unknown, not that it is gone.
 * Staleness is judged against the window the FETCH used (FetchResult.window_start), never
   one recomputed from this process's clock, which may have crossed midnight since.
 * Even on a clean fetch, a delete pass that would remove more than half of the upcoming
@@ -449,15 +454,25 @@ def marker_last_attempt(marker: dict | None) -> datetime | None:
     return _marker_time(marker, "last_attempt") or _marker_time(marker, "last_run")
 
 
-def stamp_last_attempt(service, cal_id: str, marker: dict, at: datetime) -> None:
+def marker_last_deep_attempt(marker: dict | None) -> datetime | None:
+    """When the last run that set out to sweep DEEP started, whether or not it finished.
+    Compared with last_deep_sweep (stamped only by a deep sweep that completed cleanly, at
+    its finish) it tells resolve_depth whether that attempt failed."""
+    return _marker_time(marker, "last_deep_attempt")
+
+
+def stamp_last_attempt(service, cal_id: str, marker: dict, at: datetime,
+                       deep: bool = False) -> None:
     """Record on the existing marker that a run started, before it sends Timely anything.
 
     Stamped at the START rather than with the rest of the marker at the end, so a run that
     dies part-way — an untrusted fetch, a throttle abort, the job timeout — still counts as
     an attempt: the skip gate exists precisely so the next tick does not pile straight back
-    onto Timely after one of those. The whole private map is sent back with the one key
+    onto Timely after one of those. The whole private map is sent back with only the stamp
     changed, so nothing else on the marker (last_run, last_deep_sweep) is lost whether
-    Google merges the map or replaces it.
+    Google merges the map or replaces it. A deep run also stamps last_deep_attempt with the
+    same instant, which is how the next auto run learns that a deep sweep started and never
+    completed (see resolve_depth).
 
     This is also the run's first WRITE, and preflight only proved a read. A refusal that
     every later write would hit too — a calendar shared read-only, an exhausted quota —
@@ -469,6 +484,8 @@ def stamp_last_attempt(service, cal_id: str, marker: dict, at: datetime) -> None
     """
     from googleapiclient.errors import HttpError
     private = dict(_marker_private(marker), last_attempt=at.isoformat())
+    if deep:
+        private["last_deep_attempt"] = at.isoformat()
     try:
         _execute(service.events().patch(calendarId=cal_id, eventId=MARKER_ID,
                                         body={"extendedProperties": {"private": private}}))
@@ -483,6 +500,7 @@ def stamp_last_attempt(service, cal_id: str, marker: dict, at: datetime) -> None
 
 def write_marker(service, cal_id: str, *, checked_at: datetime, entry_count: int,
                  last_deep: datetime | None, last_attempt: datetime | None = None,
+                 last_deep_attempt: datetime | None = None,
                  succeeded: bool = True, previous_success: datetime | None = None,
                  dry_run: bool = False) -> None:
     """Publish an all-day 'last checked' event.
@@ -542,10 +560,14 @@ def write_marker(service, cal_id: str, *, checked_at: datetime, entry_count: int
         # checked_at: the skip gate measures start-to-start, and recording the finish would
         # push every later window back by however long this run took — a 38-minute deep
         # sweep would make the next on-time tick, 22 minutes after it ended, look too soon.
+        # last_deep_attempt is carried for the same reason: a near run that dropped it
+        # would hide the failed deep sweep before it from the next auto decision.
         "extendedProperties": {"private": dict(
             **({"last_run": last_run.isoformat()} if last_run else {}),
             **({"last_deep_sweep": last_deep.isoformat()} if last_deep else {}),
-            **({"last_attempt": last_attempt.isoformat()} if last_attempt else {}))},
+            **({"last_attempt": last_attempt.isoformat()} if last_attempt else {}),
+            **({"last_deep_attempt": last_deep_attempt.isoformat()}
+               if last_deep_attempt else {}))},
     }
     if dry_run:
         return
@@ -569,17 +591,52 @@ def resolve_depth(config: Config, requested: str, marker: dict | None,
 
     Takes the marker main() already read rather than fetching its own: the skip gate, this
     decision and the final deep-sweep stamp must all judge the SAME copy.
+
+    A deep sweep that is due is still put off for ONE run when the run before this one was
+    a deep sweep that never completed (last_deep_attempt is the latest attempt, and no
+    last_deep_sweep followed it). Only a clean deep sweep records itself, so re-picking
+    deep every time meant that while deep sweeps kept failing no near sweep ran at all —
+    and the condition that fails a ~1575-request deep sweep (the fetch aborts a run after
+    a handful of fully-throttled requests) often spares a ~240-request near one. Days 0-21
+    then went unrefreshed, booked openings stayed advertised, and every run exited 2.
+    Alternating keeps the near window fresh every other run while deep keeps being retried.
     """
     if requested == "near":
         return config.near_lookahead_days, False
     if requested == "full":
         return config.lookahead_days, True
 
-    since = _elapsed(marker_last_deep_sweep(marker),
-                     now or datetime.now(ZoneInfo(config.timezone)))
-    if since is None or since >= timedelta(hours=config.deep_sweep_every_hours):
-        return config.lookahead_days, True
-    return config.near_lookahead_days, False
+    now = now or datetime.now(ZoneInfo(config.timezone))
+    since = _elapsed(marker_last_deep_sweep(marker), now)
+    if since is not None and since < timedelta(hours=config.deep_sweep_every_hours):
+        return config.near_lookahead_days, False
+    if _last_attempt_was_a_failed_deep_sweep(marker, now):
+        print("depth: a deep sweep is due, but the last run was one that did not complete; "
+              "sweeping near this time so days 0-"
+              f"{config.near_lookahead_days} stay fresh, and deep again on the next run")
+        return config.near_lookahead_days, False
+    return config.lookahead_days, True
+
+
+def _last_attempt_was_a_failed_deep_sweep(marker: dict | None, now: datetime) -> bool:
+    """Whether the most recent run set out to sweep deep and recorded no deep sweep after.
+
+    A clean deep sweep stamps last_deep_sweep at its FINISH, never before its start, so
+    one at or after last_deep_attempt means that attempt completed. Absent or unreadable
+    stamps read as "no failed deep attempt known", which leaves the old rule — go deep
+    whenever it is due — in charge.
+    """
+    def aware(d: datetime | None) -> datetime | None:
+        return d.replace(tzinfo=now.tzinfo) if d is not None and d.tzinfo is None else d
+
+    tried = aware(marker_last_deep_attempt(marker))
+    if tried is None:
+        return False
+    latest = aware(marker_last_attempt(marker))
+    if latest is not None and latest > tried:
+        return False                     # a run since then: deep has its turn again
+    done = aware(marker_last_deep_sweep(marker))
+    return done is None or done < tried
 
 
 # ---------------------------------------------------------------- diff + apply
@@ -589,24 +646,42 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
 
     tz = ZoneInfo(config.timezone)
     entries = build_entries(result.events, config.event_style)
+    staff_ok, staff_planned = result.staff_ok, result.staff_planned
 
     # A failed notices scrape returns None (distinct from "" for a genuinely empty banner).
     # The banner text is an input to every description, so treating a 20-second kidanyc.com
     # blip as "banner cleared" would rewrite all ~3300 events, then rewrite them back next run.
-    # Descriptions are only rewritten when we saw EVERY service. A failed service lookup
-    # means we do not know whether it is bookable — not that it isn't — and dropping it
-    # from the description asserts the stronger claim. Timely persistently 429s two
-    # /Booking/Service POSTs, so without this ~16 entries flip-flop between two description
-    # states every hour: the service vanishes on a failed run and returns on the next.
-    complete = result.lookups_failed == 0
-    compare_description = result.notices is not None and complete
-    if not complete:
-        print(f"::warning::{result.lookups_failed} service lookup(s) failed; leaving "
-              f"existing descriptions alone rather than asserting those services are gone")
+    # A description is only rewritten when we saw EVERY service its stylist offers. A
+    # failed service lookup means we do not know whether it is bookable — not that it isn't
+    # — and dropping it from the description asserts the stronger claim. Timely
+    # persistently 429s two /Booking/Service POSTs, so without this ~16 entries flip-flop
+    # between two description states every hour: the service vanishes on a failed run and
+    # returns on the next.
+    #
+    # Judged per STYLIST wherever the fetch says whose lookups failed. Every failure is
+    # charged to the stylists it hid (fetch() puts all of a failed service's eligible staff
+    # in staff_failed), and those stylists are withheld whole below — so the descriptions
+    # still compared all belong to someone every one of whose lookups landed. Freezing
+    # everyone's instead, as a single global "any lookup failed" did, kept a covered
+    # stylist's calendar offering a service at a time it had moved away from on every run
+    # where anything anywhere failed. Only a result that does not say whose (staff_ok None,
+    # a capture from before it existed) still freezes them all.
+    def _compare_description(who: str) -> bool:
+        if result.notices is None:
+            return False
+        if result.lookups_failed == 0:
+            return True
+        return staff_ok is not None and who in staff_ok
+
+    if result.lookups_failed and staff_ok is None:
+        print(f"::warning::{result.lookups_failed} service lookup(s) failed and this result "
+              f"does not say whose; leaving existing descriptions alone rather than "
+              f"asserting those services are gone")
     desired = {e.google_event_id(): entry_body(e, config, result.notices) for e in entries}
     # Side tables keyed the same way as `desired`, so the write passes can reason about an
     # entry's stylist, size and time span without re-deriving them from the body.
     _entry_stylist = {e.google_event_id(): str(e.stylist_id) for e in entries}
+    compare_desc = {eid: _compare_description(who) for eid, who in _entry_stylist.items()}
     _entry_openings = {e.google_event_id(): e.opening_count for e in entries}
     _spans: dict[str, list[tuple[datetime, datetime, str]]] = {}
     for e in entries:
@@ -686,8 +761,6 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     # entries alone rather than deleting on information we know is incomplete. Without this
     # a single flaky stylist (the busiest owns 9 of 60 lookups = 15%, inside the 20% slack
     # that still reports ok=True) would be wiped off the public calendar.
-    staff_ok, staff_planned = result.staff_ok, result.staff_planned
-
     def _uncovered(who: str | None) -> bool:
         """True for a stylist we LOOKED FOR this run and could not see completely.
 
@@ -755,7 +828,15 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     blind_writes = [eid for eid in desired if _uncovered(_entry_stylist[eid])]
     withheld_writes = sum(1 for eid in blind_writes
                           if eid not in existing
-                          or _needs_patch(existing[eid], desired[eid], compare_description))
+                          or _needs_patch(existing[eid], desired[eid], compare_desc[eid]))
+    # A withheld patch that would SHRINK an entry is a withheld delete of the openings it
+    # gives up, and counts toward skipped_delete like one — exactly as pass 4 counts a split
+    # block it keeps wide. Counting only stale entries let a stylist uncovered on every run
+    # (one of their lookups failing persistently) keep a booked mid-block opening up for
+    # good: the head stays and keeps its id, so nothing is stale, and every run exited 0.
+    # A withheld insert or a growing patch only under-advertises, and stays a warning.
+    withheld_shrinks = sum(1 for eid in blind_writes if eid in existing
+                           and _openings_of(existing[eid]) > _entry_openings[eid])
     for eid in blind_writes:
         desired.pop(eid)
     # The changeover purge needs the SAME authority. It is the one delete path that runs
@@ -787,10 +868,13 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
         blind = sorted({_entry_stylist[eid] for eid in blind_writes}
                        | {_stylist_of(existing[eid]) for eid in held}
                        | {_stylist_of(obsolete[eid]) for eid in held_obs})
+        shrinks = (f" ({withheld_shrinks} of them a block that would shrink)"
+                   if withheld_shrinks else "")
         print(f"::warning::{len(blind)} stylist(s) could not be seen completely this run "
-              f"({', '.join(blind)}); leaving them exactly as they are: withholding "
-              f"{len(held) + len(held_obs)} delete(s) and {withheld_writes} write(s)")
-    stats["skipped_delete"] += len(held) + len(held_obs)
+              f"({', '.join(blind)}); leaving them as they are: withholding "
+              f"{len(held) + len(held_obs) + withheld_shrinks} delete(s){shrinks} and "
+              f"{withheld_writes - withheld_shrinks} write(s)")
+    stats["skipped_delete"] += len(held) + len(held_obs) + withheld_shrinks
 
     # Narrowing patches: an entry the feed still has under the same id, whose STORED span
     # other feed entries of the same stylist now share. A block keeps its id while its
@@ -804,7 +888,7 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     for eid, body in desired.items():
         item = existing.get(eid)
         if (item is None or _scheme(eid) != "blocks" or starts[eid] is None
-                or not _needs_patch(item, body, compare_description)):
+                or not _needs_patch(item, body, compare_desc[eid])):
             continue
         others = [k for s, e, k in _spans.get(_entry_stylist[eid], ())
                   if k != eid and _overlaps(starts[eid], ends[eid], s, e)]
@@ -912,7 +996,7 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
         item = existing.get(eid)
         if item is None:
             continue
-        if not _needs_patch(item, body, compare_description):
+        if not _needs_patch(item, body, compare_desc[eid]):
             stats["unchanged"] += 1
             landed.add(eid)
             continue
@@ -963,8 +1047,16 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
     # can overlap one being narrowed now, and its delete waits for that patch to land.
     # Unlike the deletes they are not stopped by the guards above, any more than pass 2's
     # patches are: everything that takes over their span has already landed.
+    #
+    # ...and they go LATEST first. A narrowing entry only ever waits on entries that start
+    # after it — what overlaps its stored span, which begins at its own first opening, since
+    # feed blocks of one stylist never overlap — and some of those may be narrowing too.
+    # Walked earliest-first, X was checked before the later Y it waits on had been patched,
+    # so a run where nothing failed still kept X wide: two booked openings advertised, and
+    # a warning blaming a write failure that never happened. Latest-first, every narrowing
+    # entry is settled before anything that waits on it is checked.
     kept_wide = 0
-    for eid, others in narrowing.items():
+    for eid, others in sorted(narrowing.items(), key=lambda kv: starts[kv[0]], reverse=True):
         if all(r in landed for r in others):
             do_patch(eid)
         else:
@@ -979,9 +1071,13 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
                 continue
             do_delete(eid, "delete")
     if kept or kept_wide:
+        # Not "failed to write": one failed insert can keep a chain of blocks waiting on
+        # each other, so the count kept here is not the count of writes that failed.
         print(f"::warning::kept {kept} superseded entr(ies) whole and {kept_wide} split "
-              f"block(s) at their old size, because what replaces them failed to write — "
-              f"better a stale entry than unrepresented availability")
+              f"block(s) at their old size: what takes over their span did not land this "
+              f"run ({len(failures)} write(s) failed; one can hold back a chain of blocks "
+              f"waiting on each other) — better a stale entry than unrepresented "
+              f"availability")
 
     # ---- 5. the event_style changeover purge, LAST and separately guarded ----
     # These are entries written under the other style. They run after the inserts, not with
@@ -1028,7 +1124,7 @@ def sync(config: Config, result: FetchResult, service=None, dry_run=False,
                 do_delete(eid, "migrated")
             if kept_obs:
                 print(f"::warning::kept {kept_obs} entr(ies) of the previous event_style "
-                      f"whose replacement failed to write; the next run retires them")
+                      f"whose replacement did not land this run; the next run retires them")
 
     if failures:
         print(f"::warning::{len(failures)} write(s) failed; first 20:")
@@ -1159,17 +1255,19 @@ def main(argv=None):
     skip gate — without patching sys.argv.
 
     Order matters and is deliberate: read the marker once, publish the health output, run
-    the skip gate, stamp last_attempt, and only then resolve depth and contact Timely. A
-    skipped tick therefore costs a couple of calendar reads (preflight's calendars.get and
-    the marker) and zero Timely requests, and a calendar we can read but not write stops
-    at the stamp, before Timely is sent anything.
+    the skip gate, resolve depth, stamp last_attempt (and last_deep_attempt on a deep
+    run), and only then contact Timely. A skipped tick therefore costs a couple of
+    calendar reads (preflight's calendars.get and the marker) and zero Timely requests,
+    and a calendar we can read but not write stops at the stamp, before Timely is sent
+    anything.
     """
     ap = argparse.ArgumentParser(description="Sync KIDA NYC open slots to Google Calendar")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the insert/patch/delete diff without writing")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--depth", choices=("auto", "near", "full"), default="auto",
-                    help="auto (default) goes deep only when the last deep sweep is stale")
+                    help="auto (default) goes deep when the last deep sweep is stale, "
+                         "unless the run before was a deep sweep that did not complete")
     ap.add_argument("--ics", default=None, help="also write an .ics file to this path")
     ap.add_argument("--fetch-json", default=None,
                     help="write the fetch result to this path (for artifacting/replay)")
@@ -1240,6 +1338,15 @@ def main(argv=None):
             _summary_line(f"⏭ {msg}")
             return
     _github_output("skipped", "false")
+
+    # Depth next: it decides how far the fetch reaches, and the stamp below records a deep
+    # attempt so the next auto run can tell one that never completed (see resolve_depth).
+    # Judged on the marker as read, before this run's own stamp lands on it.
+    days, deep = resolve_depth(config, args.depth, marker, now=started)
+    config.lookahead_days = days
+    print(f"depth: {'FULL' if deep else 'near'} ({days} days)")
+    last_deep_attempt = started if deep else marker_last_deep_attempt(marker)
+
     # Only an existing marker is stamped. Creating one here would publish a 'checked'
     # title for a run that has not checked anything yet; write_marker() at the end carries
     # `started` into the marker it creates instead. Every non-skipped run stamps, near and
@@ -1247,16 +1354,11 @@ def main(argv=None):
     # behind one must see it.
     if marker is not None and not args.dry_run:
         try:
-            stamp_last_attempt(service, cal_id, marker, started)
+            stamp_last_attempt(service, cal_id, marker, started, deep=deep)
         except WriteAborted as e:
             print(f"::error::{e}")
             _summary_line(f"❌ cannot write to the calendar: {e}")
             raise SystemExit(1)
-
-    # Depth first: it decides how far the fetch reaches.
-    days, deep = resolve_depth(config, args.depth, marker, now=started)
-    config.lookahead_days = days
-    print(f"depth: {'FULL' if deep else 'near'} ({days} days)")
 
     if args.from_json:
         payload = Path(args.from_json).read_text(encoding="utf-8")
@@ -1276,6 +1378,9 @@ def main(argv=None):
         # feed and stamps last_deep_sweep, suppressing the real sweep for hours.
         if captured:
             deep = int(captured) >= deep_window
+            # The final marker follows suit, so a replay that turned out near does not
+            # leave a deep attempt behind for the next auto run to read as a failed one.
+            last_deep_attempt = started if deep else marker_last_deep_attempt(marker)
         # The capture's own window_start rides along in `result`, so sync() anchors the
         # window on the day the capture was FETCHED. Re-anchoring it on the replay day
         # would put every day after the captured window inside it, and delete it unseen.
@@ -1372,8 +1477,8 @@ def main(argv=None):
     if stats["skipped_delete"] > SKIPPED_DELETE_EXIT_FLOOR:
         failing = True
         errors.append(f"::error::{stats['skipped_delete']} deletes were withheld this run "
-                      f"(stylists we could not see completely, or replacements that failed "
-                      f"to write). The calendar is stale for those people.")
+                      f"(stylists we could not see completely, or replacements that did not "
+                      f"land). The calendar is stale for those people.")
 
     if service is not None and not args.dry_run:
         now = datetime.now(tz)
@@ -1391,6 +1496,7 @@ def main(argv=None):
                      # run's window: a near run sees 21 of 90 days. See sync().
                      entry_count=stats["live_openings"],
                      last_deep=last_deep, last_attempt=started,
+                     last_deep_attempt=last_deep_attempt,
                      succeeded=not failing,
                      previous_success=_marker_time(marker, "last_run"))
 

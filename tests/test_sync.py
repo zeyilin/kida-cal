@@ -1026,7 +1026,7 @@ def test_an_under_way_block_of_a_half_seen_stylist_is_left_standing(clock, capsy
     lookups failed and she has a held future entry, so her writes were withheld — but the
     started block skipped the authority check, was classed a re-key, and was deleted
     because its never-attempted replacement was not in failed_ids. Nao went dark for the
-    day. A stylist we cannot see completely must be left exactly as they are."""
+    day. A stylist we cannot see completely is left as they are, bar what has ended."""
     clock(T0)
     cfg = mkconfig(event_style="blocks")
     under_way = [_at(0, h) for h in (10, 11, 12, 13, 14)]
@@ -1633,3 +1633,200 @@ def test_a_deleted_marker_reads_as_no_marker():
     sync_calendar.write_marker(svc, "cal", checked_at=now, entry_count=1, last_deep=now)
     svc.store[MARKER_ID]["status"] = "cancelled"
     assert sync_calendar.read_marker(svc, "cal") is None
+
+
+# --------------------------------------------------------------- round 2: review findings
+def _offering(ev, *names):
+    """The same opening, bookable for exactly these services."""
+    menu = {"Hair Cut": ServiceOption("Hair Cut", "$75", 55, False),
+            "Beard Trim": ServiceOption("Beard Trim", "$40", 25, False)}
+    return Event(stylist_id=ev.stylist_id, stylist=ev.stylist, stylist_role=ev.stylist_role,
+                 start=ev.start, book_url=ev.book_url, options=[menu[n] for n in names])
+
+
+@pytest.mark.parametrize("style", ["blocks", "slots"])
+def test_one_stylists_failed_lookup_does_not_freeze_everyone_elses_descriptions(clock, style):
+    """One failed lookup ANYWHERE stopped description updates for EVERY stylist. Beard Trim
+    moved from Nao's 10:00 to her 11:00 — same ids, same spans, same titles, so only the
+    descriptions changed — and because Sachi had a failed lookup, Nao's calendar kept
+    offering a 10:00 Beard Trim that was no longer bookable and never offered the 11:00
+    one that was, on every run where anything anywhere failed. Every stylist with a failed
+    lookup is already withheld whole (rule 1), so whatever is still compared belongs to
+    someone every one of whose lookups landed."""
+    clock(T0)
+    cfg = mkconfig(event_style=style)
+    before = [_offering(_at(3, 10), "Hair Cut", "Beard Trim"), _offering(_at(3, 11), "Hair Cut")]
+    after = [_offering(_at(3, 10), "Hair Cut"), _offering(_at(3, 11), "Hair Cut", "Beard Trim")]
+    old = build_entries(before, style)
+    svc = FakeCalendarService(events=[_existing_entry(e, cfg) for e in old])
+    want = {e.google_event_id(): sync_calendar.entry_body(e, cfg, "")
+            for e in build_entries(after, style)}
+    assert set(want) == {e.google_event_id() for e in old}      # only descriptions moved
+
+    stats = sync_calendar.sync(
+        cfg, _res(after + [_at(4, 9, "sachi")], staff_ok={"nao"},
+                  staff_planned={"nao", "sachi"}, lookups_failed=1),
+        service=svc)
+
+    for eid, body in want.items():
+        assert svc.live()[eid]["description"] == body["description"]
+    assert stats["patch"] == len(want)
+    assert svc.methods("insert") == []                          # Sachi is still withheld
+
+
+def test_a_narrowing_that_waits_on_a_later_narrowing_lands_on_a_clean_run(clock, capsys):
+    """A narrowing entry only ever waits on entries that start AFTER it (what overlaps its
+    stored span, which begins at its own first opening). Walking them earliest-first
+    checked X before Y — which X waits on, and which was itself waiting to narrow — so X
+    was kept wide on a run where nothing failed: still advertising 11:00 and 14:00, both
+    booked, and a warning that a write had failed when none had."""
+    clock(T0)
+    cfg = mkconfig(event_style="blocks")
+    # Left by an earlier run whose narrowing patch of X failed after 11:00 was booked: the
+    # tail Y landed, and X is still stored wide over it.
+    x_wide = [_at(3, h) for h in (9, 10, 11, 12, 13, 14, 15)]
+    y_wide = [_at(3, h) for h in (12, 13, 14, 15)]
+    svc, (x, y) = _cal(cfg, x_wide, y_wide)
+    # Now 14:00 is booked as well: X narrows onto Y', Y narrows onto the new Z.
+    head, mid, z = [_at(3, h) for h in (9, 10)], [_at(3, h) for h in (12, 13)], [_at(3, 15)]
+    assert (_block_id(head), _block_id(mid)) == (x, y)
+
+    stats = sync_calendar.sync(cfg, _res(head + mid + z, staff_ok={"nao"},
+                                         staff_planned={"nao"}), service=svc)
+
+    assert svc.live()[x]["summary"] == "Nao · 2 open"
+    assert svc.live()[y]["summary"] == "Nao · 2 open"
+    assert set(svc.live()) == {x, y, _block_id(z)}
+    writes = [(m, e) for m, e in svc.calls if m in ("patch", "insert", "delete")]
+    assert writes == [("insert", _block_id(z)), ("patch", y), ("patch", x)]
+    assert stats["skipped_delete"] == 0
+    assert "failed" not in capsys.readouterr().out
+
+
+def test_a_narrowing_kept_behind_a_failed_one_says_what_actually_failed(clock, capsys):
+    """When the chain IS broken by a failure, both blocks stay wide (X waits on Y, which
+    waits on Z) — and the warning counts the one write that failed, not two."""
+    clock(T0)
+    cfg = mkconfig(event_style="blocks")
+    svc, (x, y) = _cal(cfg, [_at(3, h) for h in (9, 10, 11, 12, 13, 14, 15)],
+                       [_at(3, h) for h in (12, 13, 14, 15)])
+    head, mid, z = [_at(3, h) for h in (9, 10)], [_at(3, h) for h in (12, 13)], [_at(3, 15)]
+    svc.fail_plan[("insert", _block_id(z))] = [http_error(500, "Server Error", "backendError")]
+
+    stats = sync_calendar.sync(cfg, _res(head + mid + z, staff_ok={"nao"},
+                                         staff_planned={"nao"}), service=svc)
+
+    assert svc.methods("patch") == []
+    assert stats["skipped_delete"] == 2 and stats["failed_insert"] == 1
+    out = capsys.readouterr().out
+    assert "kept 0 superseded entr(ies) whole and 2 split block(s)" in out
+    assert "did not land this run (1 write(s) failed;" in out
+    assert "failed to write" not in out
+
+
+def test_a_half_seen_stylists_shrinking_block_counts_as_a_withheld_delete(clock, capsys):
+    """Rule 1 withholds an uncovered stylist's patches as well as their deletes, but only
+    the deletes reached skipped_delete. A block that would shrink retires openings it
+    advertises — a delete of that part, which pass 4 already counts as one when it keeps a
+    split block wide — so a stylist uncovered on every run kept 12 booked 12:00s advertised
+    with skipped_delete at 0 and every run exiting 0: no issue, a green heartbeat."""
+    clock(T0)
+    cfg = mkconfig(event_style="blocks")
+    days = range(1, 13)
+    svc, ids = _cal(cfg, *[[_at(d, h) for h in (10, 11, 12, 13, 14)] for d in days])
+    feed = [_at(d, h) for d in days for h in (10, 11, 13, 14)]     # 12:00 booked, daily
+
+    stats = sync_calendar.sync(
+        cfg, _res(feed + [_at(2, 9, "sachi")], staff_ok={"sachi"},
+                  staff_planned={"nao", "sachi"}, lookups_failed=1),
+        service=svc)
+
+    assert all(svc.live()[i]["summary"] == "Nao · 5 open" for i in ids)    # still held
+    assert stats["skipped_delete"] == 12 > sync_calendar.SKIPPED_DELETE_EXIT_FLOOR
+    assert "withholding 12 delete(s)" in capsys.readouterr().out
+
+
+def test_a_half_seen_stylists_growing_block_is_withheld_but_is_no_delete(clock):
+    """Only a write that would RETIRE advertised openings is a withheld delete. Holding back
+    a new opening under-advertises, the lesser harm, and stays a warning."""
+    clock(T0)
+    cfg = mkconfig(event_style="blocks")
+    svc, (block,) = _cal(cfg, [_at(3, h, "sick") for h in (9, 10)])
+
+    stats = sync_calendar.sync(
+        cfg, _res([_at(3, h, "sick") for h in (9, 10, 11)] + [_at(4, 9)], staff_ok={"nao"},
+                  staff_planned={"nao", "sick"}, lookups_failed=1),
+        service=svc)
+
+    assert svc.methods("patch") == []
+    assert stats["skipped_delete"] == 0
+
+
+# --------------------------------------------------------------- auto depth after a failed deep
+def _depth_marker(**stamps):
+    return {"id": MARKER_ID, "status": "confirmed", "summary": "checked",
+            "start": {"date": T0.date().isoformat()},
+            "end": {"date": (T0.date() + timedelta(days=1)).isoformat()},
+            "extendedProperties": {"private": {k: v.isoformat() for k, v in stamps.items()}}}
+
+
+def test_auto_goes_near_straight_after_a_deep_sweep_that_did_not_complete():
+    """A deep sweep makes ~1575 Timely requests to a near one's ~240, so a throttle that
+    aborts every deep sweep can leave near sweeps untouched. Re-picking deep on every run
+    then meant no near sweep ever ran: days 0-21 went unrefreshed and every run exited 2."""
+    cfg = mkconfig()
+    started = T0 - timedelta(hours=1)
+    m = _depth_marker(last_attempt=started, last_deep_attempt=started,
+                      last_deep_sweep=T0 - timedelta(hours=10))
+    assert sync_calendar.resolve_depth(cfg, "auto", m, now=T0) == (cfg.near_lookahead_days,
+                                                                     False)
+
+
+def test_auto_retries_deep_once_a_near_run_has_had_its_turn():
+    cfg = mkconfig()
+    m = _depth_marker(last_attempt=T0 - timedelta(hours=1),
+                      last_deep_attempt=T0 - timedelta(hours=2),
+                      last_deep_sweep=T0 - timedelta(hours=10))
+    assert sync_calendar.resolve_depth(cfg, "auto", m, now=T0) == (cfg.lookahead_days, True)
+
+
+def test_a_deep_sweep_that_completed_is_not_read_as_a_failed_one():
+    """Its last_deep_sweep is its FINISH, later than the start stamped as last_deep_attempt;
+    once that is stale, the next deep sweep is simply due."""
+    cfg = mkconfig()
+    started = T0 - timedelta(hours=cfg.deep_sweep_every_hours + 1)
+    m = _depth_marker(last_attempt=started, last_deep_attempt=started,
+                      last_deep_sweep=started + timedelta(minutes=38))
+    assert sync_calendar.resolve_depth(cfg, "auto", m, now=T0) == (cfg.lookahead_days, True)
+
+
+def test_an_explicit_full_is_deep_even_right_after_a_failed_one():
+    cfg = mkconfig()
+    started = T0 - timedelta(hours=1)
+    m = _depth_marker(last_attempt=started, last_deep_attempt=started)
+    assert sync_calendar.resolve_depth(cfg, "full", m, now=T0) == (cfg.lookahead_days, True)
+
+
+def test_stamping_a_deep_attempt_keeps_every_other_marker_field():
+    svc = FakeCalendarService()
+    deep = datetime(2026, 10, 14, 4, 0, tzinfo=NY)
+    sync_calendar.write_marker(svc, "cal", checked_at=deep, entry_count=5, last_deep=deep)
+    at = deep + timedelta(hours=7)
+
+    sync_calendar.stamp_last_attempt(svc, "cal", sync_calendar.read_marker(svc, "cal"), at,
+                                     deep=True)
+
+    assert svc.live()[MARKER_ID]["extendedProperties"]["private"] == {
+        "last_run": deep.isoformat(), "last_deep_sweep": deep.isoformat(),
+        "last_attempt": at.isoformat(), "last_deep_attempt": at.isoformat()}
+
+
+def test_write_marker_keeps_the_last_deep_attempt():
+    """write_marker REPLACES the marker; a near run that dropped last_deep_attempt would
+    make the failed deep sweep before it invisible to the next auto decision."""
+    svc = FakeCalendarService()
+    tried = datetime(2026, 10, 14, 9, 0, tzinfo=NY)
+    sync_calendar.write_marker(svc, "cal", checked_at=tried + timedelta(hours=1),
+                               entry_count=5, last_deep=None, last_deep_attempt=tried)
+    private = svc.live()[MARKER_ID]["extendedProperties"]["private"]
+    assert private["last_deep_attempt"] == tried.isoformat()

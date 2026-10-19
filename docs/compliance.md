@@ -37,8 +37,8 @@ Disallow: /cdn-cgi/
   anonymous session through the funnel; nothing is reserved or submitted.
 - **Low volume.** Sequential requests, ~1 req/sec (`request_delay_seconds`), honest
   self-identifying User-Agent, exponential backoff on 429/5xx, hard per-run request cap,
-  and at most one sweep per ~50 minutes however often the workflow is triggered, with
-  the few exceptions listed under "How often we look" below.
+  and at most one sweep started per ~50 minutes however often the workflow is
+  triggered, with the few exceptions listed under "How often we look" below.
 - **No PII stored.** We persist availability (times), not people.
 
 ### Measured volume (not estimated)
@@ -73,13 +73,21 @@ September 2026 about 4 a day, with a median gap of 5–6 hours — and the extra
 exist only to give a run more chances to be delivered at all. What bounds the load on
 Timely is a gate in the program itself:
 
-- Every run the workflow starts passes `--skip-if-checked-within 50`. Before sending
-  Timely anything it reads the calendar's status marker, and if the last run **started**
-  less than 50 minutes ago it exits without making a single Timely request.
+- Every run the workflow starts passes `--skip-if-checked-within 50` (a re-run passes 0;
+  see the exceptions below). Before sending Timely anything it reads the calendar's
+  status marker, and if the last run **started** less than 50 minutes ago it exits
+  without making a single Timely request.
 - The gate measures start-to-start, and a run records its start on the marker *before*
-  its first Timely request, so a run that fails, is throttled or times out still counts.
-  A burst of ticks after a throttled run cannot pile straight back onto Timely.
-- Net effect: at most one sweep per ~50 minutes however many ticks (or external
+  its first Timely request, so a run that fails or is throttled still counts: ticks that
+  land within 50 minutes of its start skip.
+- Start-to-start bounds how often a sweep *starts*, not the rest Timely gets between
+  sweeps. A run that itself lasts 50 minutes or more — a throttled deep sweep that ran
+  long, or one cut off by the job's 120-minute timeout — can be followed at once by the
+  run queued behind it (the workflow's concurrency group holds at most one), which finds
+  the start stamp old enough and sweeps. When the long run was a deep sweep that did not
+  complete, that follow-on sweep is normally the short near-term one (`resolve_depth` in
+  `src/sync_calendar.py`).
+- Net effect: at most one sweep starts per ~50 minutes however many ticks (or external
   triggers, see the README) arrive, outside the exceptions below. With every tick on time
   that works out to hourly. The ceiling is ~29 sweeps a day, against the 24 the old single
   hourly cron line allowed in principle; in practice GitHub has been delivering about 4.
@@ -88,14 +96,21 @@ The exceptions are known and rare:
 
 - A manual dispatch with depth `near` or `full` is a person asking for a run now, and is
   not gated. Depth `auto` — which is what the README's external trigger sends — is.
+- A re-run (GitHub's "Re-run jobs") is likewise a person asking, and is not gated. It is
+  almost always the retry of a run that just failed, whose own start stamp would
+  otherwise turn the retry into a no-op. GitHub never re-runs anything by itself.
 - A calendar with no status marker — a new setup, or one whose marker someone deleted —
   has nothing to measure from, and keeps having nothing until a run gets far enough to
   write one (past the fetch, to the calendar writes). The start is only ever recorded on
   an existing marker, so until then every tick sweeps, including straight after a
   throttled or failed run, and with no record of a deep sweep each one goes deep. If a new
   setup's first runs are being throttled, disable the workflow until it is resolved.
-- Recording the start is best-effort: if that one calendar write fails, the run carries
-  on and the next tick is not skipped.
+- Recording the start is best-effort for transient errors (429, 5xx, a rate-limit 403):
+  the run warns and carries on. Its start is still recorded when the marker is rewritten
+  at the end, so the next tick is gated as usual — unless the run dies before that
+  rewrite (an untrusted or throttled fetch, an aborted write pass, the timeout), which
+  leaves the next tick ungated. A refusal every write would hit (a read-only share, an
+  exhausted quota) is not transient: it stops the run before any Timely request.
 
 **The response cache is a development aid only.** It cannot hit in CI (runners start
 clean, `.cache/` is gitignored, each key is requested once per run), so it was never a

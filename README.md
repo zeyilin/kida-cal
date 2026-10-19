@@ -44,9 +44,11 @@ tell you that a scheduled run never *started* — which is how this calendar onc
 for three days without a single alert.
 
 When the sync keeps failing, it opens a GitHub issue — but only once the calendar has gone
-12 hours or more without a successful refresh, or when a run fails before it can even tell
-(a missing secret, say). A one-off failure just leaves a warning on that run, and the issue
-closes itself after the next successful sync.
+12 hours or more without a successful refresh, or when it can't tell how long that's been
+(a missing secret, say, or a new setup that has never synced cleanly). A one-off failure
+just leaves a warning on that run, and the issue closes itself after the next successful
+sync. To retry a failed run straight away, use **Re-run all jobs** on it: a re-run always
+checks, even within the 50 minutes.
 
 ### Getting a reliable hourly refresh
 
@@ -65,7 +67,7 @@ nothing either, and it gets in the way of runs you start by hand (below). GitHub
 good request with `204 No Content`. Tokens expire, so note the date.
 
 Only one run happens at a time, and GitHub keeps just one more waiting behind it: any
-newer run takes the waiting one's place. So a `near` or `full` run you start by hand while
-another is in progress can be replaced by the next automatic one, which then usually stops
-straight away. Start those when nothing is running, and if one shows up as cancelled,
-start it again.
+newer run takes the waiting one's place. So a run you start by hand — `near`, `full`, or a
+re-run — while another is in progress can be replaced by the next automatic one, which
+then usually stops straight away. Start those when nothing is running, and if one shows up
+as cancelled, start it again.

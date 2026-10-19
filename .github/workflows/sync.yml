@@ -24,14 +24,16 @@ on:
     # ever delivered, p90 gap 175 min).
     #
     # The surplus costs Timely nothing. Every run passes --skip-if-checked-within (job env
-    # below): a tick landing under 50 min after the last run STARTED — start-to-start, read
-    # off the calendar's status marker before any Timely request — exits 0 in ~30 seconds
-    # having made a couple of calendar reads and no Timely request at all. So Timely sees
-    # at most one sweep per ~50 min however many ticks arrive; with all four on time that
-    # settles at hourly (:08 + 50 = :58, so the next sweep is the following :08). 50
-    # rather than 60 is slack for delivery jitter:
-    # at 60, a sweep whose tick arrived two minutes late would make the next hour's on-time
-    # :08 skip, and that hour's sweep would wait 15 minutes for the :23.
+    # below; only a re-run, which a person asked for, passes 0): a tick landing under 50
+    # min after the last run STARTED — start-to-start, read off the calendar's status
+    # marker before any Timely request — exits 0 in ~30 seconds having made a couple of
+    # calendar reads and no Timely request at all. So at most one sweep STARTS per ~50 min
+    # however many ticks arrive (a sweep that itself runs 50+ min can be followed at once
+    # by the tick queued behind it; docs/compliance.md); with all four on time that
+    # settles at hourly (:08 + 50 = :58, so the next sweep is the following :08). 50 rather
+    # than 60 is slack for delivery jitter: at 60, a sweep whose tick arrived two minutes
+    # late would make the next hour's on-time :08 skip, and that hour's sweep would wait
+    # 15 minutes for the :23.
     #
     # If this is still not enough, README "Getting a reliable hourly refresh" — an external
     # cron dispatching this workflow — does not depend on GitHub's scheduler at all.
@@ -44,8 +46,9 @@ on:
       depth:
         # auto goes through the same freshness gate as a scheduled tick (it is what the
         # README's external trigger sends); near/full are a person asking for a run now,
-        # and the program never gates those — once they start. One dispatched while a run
-        # is in progress can be replaced before it starts; see the concurrency note below.
+        # and the program never gates those — once they start. Nor is a re-run of any run
+        # gated (see "Sync calendar"). One dispatched while a run is in progress can be
+        # replaced before it starts; see the concurrency note below.
         description: "Lookahead depth (auto = the program decides from the calendar marker)"
         type: choice
         default: auto
@@ -60,8 +63,8 @@ on:
 # a step, so they report nothing. For a surplus tick that costs nothing — the run that
 # does get to start mostly skips at the gate anyway.
 #
-# For a manual near/full dispatch it costs the run. Dispatched while a sweep is in
-# progress, it waits as the pending run; the next scheduled tick or external trigger
+# For a manual near/full dispatch (or a re-run) it costs the run. Started while a sweep is
+# in progress, it waits as the pending run; the next scheduled tick or external trigger
 # (depth auto) replaces it, and that run then usually skips at the gate, since the sweep
 # it waited behind started under 50 min before. The run someone asked for never happens
 # and shows only as a cancelled run. With four cron lines and the README's external
@@ -137,16 +140,26 @@ jobs:
           umask 077
           printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa-key.json"
 
-      # Besides exit-code (below), the program writes two outputs of its own to
-      # $GITHUB_OUTPUT, both BEFORE it sends Timely anything, so they exist even when the
-      # fetch dies:
+      # Besides exit-code (below), the program writes outputs of its own to $GITHUB_OUTPUT.
+      # These two come BEFORE it sends Timely anything, so they exist even when the fetch
+      # dies:
       #   skipped                 true = the freshness gate stopped this tick (exit 0, no
       #                           Timely request, nothing written); false = it ran.
       #   last_success_age_hours  hours since the last SUCCESSFUL sync — the last run that
       #                           exited 0; a run that exits 1 or 2 leaves it alone — to one
-      #                           decimal, e.g. 3.2. Empty when unknown (no marker yet, or
-      #                           the run died before reading it).
+      #                           decimal, e.g. 3.2. Empty when unknown: no successful sync
+      #                           is recorded on the calendar's status marker (no marker
+      #                           yet, or one that no run has succeeded on), or the run died
+      #                           before it could read the marker.
+      # (It also writes `deep` once the fetch returns; nothing here reads it.)
       # Every later step keys off these rather than guessing from files on disk.
+      #
+      # A re-run is not gated. "Re-run jobs" reuses the original run's event, so re-running
+      # a failed scheduled run is depth auto again — and the gate would read the failed
+      # attempt's own start stamp and turn the retry into a green no-op that leaves the
+      # calendar stale and the failure issue open. Like a near/full dispatch, a re-run is a
+      # person asking for a run now. GitHub never re-runs anything by itself, so
+      # GITHUB_RUN_ATTEMPT > 1 means exactly that.
       - name: Sync calendar
         id: sync
         env:
@@ -164,10 +177,15 @@ jobs:
           DEPTH: ${{ github.event.inputs.depth || 'auto' }}
         run: |
           mkdir -p public
+          gate="$SKIP_IF_CHECKED_WITHIN_MINUTES"
+          if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
+            gate=0
+            echo "::notice::Re-run (attempt ${GITHUB_RUN_ATTEMPT}): a person asked for this run, so the freshness gate is off."
+          fi
           set +e
           python -m src.sync_calendar \
             --depth "$DEPTH" \
-            --skip-if-checked-within "$SKIP_IF_CHECKED_WITHIN_MINUTES" \
+            --skip-if-checked-within "$gate" \
             --ics public/open_slots.ics \
             --fetch-json fetch-result.json
           code=$?
@@ -341,9 +359,17 @@ jobs:
       #   - an open sync-failure issue gets a comment, as before (one issue per streak);
       #   - otherwise an issue opens only when the calendar has gone STALE_ALERT_HOURS or
       #     more without a successful sync (last_success_age_hours, which the program
-      #     publishes before it fetches), or when that age is UNKNOWN — the run failed
+      #     publishes before it fetches), or when that age is UNKNOWN: the run failed
       #     before it could read the calendar's status marker (missing secret, bad key,
-      #     Google down) or there is no marker yet. That is never a Timely blip, so be loud;
+      #     Google down), or the marker records no successful sync at all (a new setup
+      #     whose runs have all failed, or no marker yet). Either way the cause is setup,
+      #     Google, or a calendar that has never once been refreshed — not a passing
+      #     Timely blip — so be loud;
+      #   - a run whose sync step itself exited 0 has just refreshed the calendar, so
+      #     whatever failed after it (an artifact upload, say) is not a stale calendar,
+      #     whatever the age measured BEFORE the sweep says. It comments on an open issue
+      #     like any failure, but never opens one; a ::warning:: says what happened. (A
+      #     skipped tick also exits 0 but refreshed nothing, so it gets the age rule.)
       #   - anything else is a ::warning:: on the run. A failure streak crosses the
       #     threshold by itself and opens the issue then: only a run that exits 0 advances
       #     the age's starting point, so through a streak — exit 1 as much as exit 2 — it
@@ -363,6 +389,7 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EXIT_CODE: ${{ steps.sync.outputs.exit-code }}
+          SKIPPED: ${{ steps.sync.outputs.skipped }}
           LAST_OK_AGE: ${{ steps.sync.outputs.last_success_age_hours }}
           # Half a day: two to three missed refreshes at GitHub's recent ~4 runs a day,
           # and the point at which README tells readers the calendar is stale.
@@ -373,10 +400,14 @@ jobs:
             --color B60205 \
             --description "sync-open-slots is failing (opened automatically)" >/dev/null 2>&1 || true
 
-          if [ -n "$LAST_OK_AGE" ]; then
+          synced=0
+          if [ "${EXIT_CODE:-}" = "0" ] && [ "${SKIPPED:-}" != "true" ]; then
+            synced=1
+            age_line="- last successful sync: this run — the sync itself succeeded and refreshed the calendar; a step after it failed"
+          elif [ -n "$LAST_OK_AGE" ]; then
             age_line="- last successful sync: ${LAST_OK_AGE} h before this run started (issue threshold ${STALE_ALERT_HOURS} h)"
           else
-            age_line="- last successful sync: unknown — this run failed before it could read the calendar's status marker, or there is no marker yet"
+            age_line="- last successful sync: unknown — no successful sync is recorded on the calendar's status marker (no marker yet, or none of its runs has succeeded), or this run failed before it could read it"
           fi
           body=$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n' \
             "Run **${JOB_STATUS}** at $(date -u +'%Y-%m-%d %H:%M UTC')." \
@@ -390,6 +421,8 @@ jobs:
           if [ -n "$num" ]; then
             gh issue comment "$num" --body "$body"
             echo "::notice::Commented on existing failure issue #${num}"
+          elif [ "$synced" -eq 1 ]; then
+            echo "::warning::The sync itself succeeded and refreshed the calendar; a later step failed (see the log above). No issue opened: the calendar is not stale."
           elif [ -z "$LAST_OK_AGE" ] || awk -v h="$LAST_OK_AGE" -v t="$STALE_ALERT_HOURS" \
               'BEGIN { exit !(h + 0 >= t + 0) }'; then
             gh issue create \

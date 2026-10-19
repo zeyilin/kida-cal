@@ -119,7 +119,11 @@ def test_filters_are_normalised(tmp_path, key, given, expected):
     ("stylists", []),                # ...as did a list whose every name was removed
     ("stylists", ["Nao", 5]),
     ("stylists", ["Nao", ""]),       # "" is a substring of every name
-    ("stylists", ["all"]),           # would be matched as the substring "all"
+    ("stylists", ["all"]),           # would be matched as the substring "all"...
+    # ...but that one is refused by the stylist-name check too, so only this one pins the
+    # rule. Without it this loads, matches no service, and every run ends with an empty
+    # plan and exit 2 instead of failing at startup.
+    ("services", ["all"]),
     ("services", ""),
     ("services", ["Hair Cut", None]),
 ])

@@ -17,6 +17,7 @@ from src.timely import BudgetExhausted, RawSlot
 
 # Two staff we have in the catalog, so nothing is skipped as unknown.
 NAO, SACHI = "175308", "24102"
+MASA = "287218"                  # in the catalog too, but in no FakeClient service
 NY = ZoneInfo("America/New_York")
 
 
@@ -439,7 +440,8 @@ def test_a_check_made_after_the_sweep_goes_through_a_fresh_session():
     reuse svcB's sweep session: by then that session has sat idle for the rest of the sweep,
     nothing in docs/timely-api.md says how long an obg session lives, and a stale one that
     answered with a well-formed empty day would read as a broken invariant and void the
-    whole run. A new session is taken through the funnel exactly as the sweep's are."""
+    whole run. A new session makes the sweep's requests in the sweep's order: the funnel,
+    then GetOpenDates for the stylist, then gettimeslots."""
     result = _fetch(verify_dedup_samples=2)
 
     assert result.ok
@@ -449,6 +451,45 @@ def test_a_check_made_after_the_sweep_goes_through_a_fresh_session():
     assert [ns for ns, _ in FakeClient.sessions] == ["", "svcA", "svcB", "svcC", "svcB"]
     assert FakeClient.sessions[4][1] == ["bootstrap", "service", "staff"]
     assert FakeClient.slot_sessions[-1] == 4
+    _, _, staff, day = FakeClient.calls[-1]
+    checked = date.fromisoformat(day)
+    assert FakeClient.calls[-2:] == [("open_dates", "svcB", staff, checked.year, checked.month),
+                                     ("time_slots", "svcB", staff, day)]
+    # Both checks were paid for, the one made after the sweep included: only the memo hits
+    # that were never re-fetched count as saved.
+    assert result.requests_saved == 5 * len(_open_days()) - len(_timeslot_calls())
+
+
+def test_a_check_made_after_the_sweep_asks_for_the_open_dates_first():
+    """Every sweep session asks GetOpenDates about a stylist before reading any of their
+    days, and so do the browser and recon/capture.py; a make-up session used to go straight
+    from the funnel to gettimeslots, an order nothing had ever been seen to answer. If that
+    order earns a well-formed empty day, the check reads it as a broken invariant and voids
+    a run whose every lookup landed — on about half of all real-menu runs, which is how
+    often a make-up session is needed. Whether live Timely does this is unknown; nothing
+    here should depend on it not doing so."""
+    class DatesFirst(FakeClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.dated = set()
+
+        def open_dates(self, staff_id, month, year):
+            self.dated.add(staff_id)
+            return super().open_dates(staff_id, month, year)
+
+        def time_slots(self, staff_id, date_iso):
+            if staff_id not in self.dated:
+                FakeClient.calls.append(("time_slots", self.ns, staff_id, date_iso))
+                FakeClient.slot_sessions.append(self.n)
+                return []           # what a well-formed "no times available" parses to
+            return super().time_slots(staff_id, date_iso)
+
+    result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=2),
+                   client_factory=DatesFirst, rng=random.Random(0))
+
+    assert FakeClient.slot_sessions[-1] == 4        # one check was made after the sweep...
+    assert not any("dedup invariant broken" in e for e in result.errors)
+    assert result.ok                                # ...and it agreed with the memo
 
 
 def test_a_check_that_cannot_be_made_is_reported_not_charged_as_a_failed_lookup():
@@ -513,6 +554,84 @@ def test_a_throttle_on_an_in_sweep_check_still_aborts_the_sweep():
     assert any("run aborted" in e for e in result.errors)
     assert result.staff_ok == set()
     assert not any(c[1] in ("s3", "s4", "s5") for c in _timeslot_calls())
+    # Nor is anything sent after it. Three checks are still unspent and s2's other pair is
+    # still unchecked, but a stop condition means stop: no make-up session for it either.
+    # (Only the request cap in src/timely.py is sticky. A throttle stop raises on the
+    # request that completes the streak and lets the next one go out, so this holds only
+    # because fetch() stops asking.)
+    assert [ns for ns, _ in FakeClient.sessions] == ["", "s1", "s2"]
+
+
+def test_no_check_is_made_after_a_sweep_that_aborted_in_a_funnel_setup():
+    """svcB takes one of its two checks as its walk ends and leaves the other for after the
+    sweep. svcC's funnel setup is then throttled, which ends the run: the check left over
+    is dropped with everything else, not sent through a fresh session."""
+    FakeClient.budget_error_setup_for = {"svcC"}
+    result = _fetch(verify_dedup_samples=2)
+
+    assert result.ok is False
+    assert [ns for ns, _ in FakeClient.sessions] == ["", "svcA", "svcB", "svcC"]
+
+
+def test_no_check_is_made_after_the_memo_was_caught_out():
+    """s2's check finds the invariant broken, which already voids the run; s2's other pair
+    and the checks still unspent could only add requests to a run that publishes nothing."""
+    result, _ = _five_cuts(0, budget=8, diverge={"s2"})
+
+    assert result.ok is False
+    assert any("dedup invariant broken for Cut 2" in e for e in result.errors)
+    assert len(FakeClient.sessions) == 6        # the probe and s1..s5; nothing after
+
+
+def test_a_throttle_on_the_last_services_check_stops_the_checks_but_not_the_run():
+    """The last service's check is made as its walk ends, inside the sweep, but there is
+    nothing left to walk by then, exactly as after the sweep. It used to abort the run all
+    the same: ok=False, exit 2, nothing written, over a request that only re-read a day
+    every lookup had already landed — while the same throttle one session later only
+    stopped the checks. The real menu's last service (docs/timely-api.md: the Junior
+    Barber's Portion Hair Cut & Beard Trim, 1h25 like the Hair Cut & Beard Trim before it)
+    is memo-served and takes its check this way on some runs."""
+    class ThrottledLastCheck(FiveCuts):
+        def time_slots(self, staff_id, date_iso):
+            # s5 is the last plan entry; past its probe day, every request it makes is a check.
+            if self.ns == "s5" and date_iso != _open_days()[0]:
+                raise BudgetExhausted("3 consecutive throttled GET /booking/gettimeslots")
+            return super().time_slots(staff_id, date_iso)
+
+    FiveCuts.diverge = set()
+    # 8 checks for 8 memo-served pairs: s2..s5 each take one as their walk ends, whatever
+    # the draw, and four are left for after the sweep.
+    result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=8),
+                   client_factory=ThrottledLastCheck, rng=random.Random(0))
+
+    assert result.lookups_ok == result.lookups_expected == 10
+    assert result.ok
+    assert result.staff_ok == {NAO, SACHI}
+    assert not any("run aborted" in e for e in result.errors)
+    assert any("spot-checks stopped" in e for e in result.errors)
+    # ...and they did stop: the four left over are not made, and no session is opened
+    # after the sweep (the probe and s1..s5 are sessions 0-5).
+    assert len(FakeClient.sessions) == 6
+
+
+def test_a_service_whose_make_up_session_would_not_open_is_not_tried_again():
+    """Three stylists, so svcB has three memo-served pairs: one checked as its walk ends,
+    two left for after the sweep. The first make-up session for svcB will not open. Its
+    second pair must not open another: a service whose funnel just failed is passed over,
+    and the check it would have cost goes to the next service on the list, if any."""
+    class ThreeStylists(FakeClient):
+        catalog = [{"service_id": sid, "name": name, "staff_ids": [NAO, SACHI, MASA],
+                    "bookable_item_id": f"{sid}:SV"}
+                   for sid, name in (("svcA", "Hair Cut"), ("svcB", "Hair Cut Deluxe"))]
+
+    FakeClient.fail_sessions = {3}    # 0 probe, 1 svcA, 2 svcB; 3 = first after the sweep
+    result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=3),
+                   client_factory=ThreeStylists, rng=random.Random(0))
+
+    assert result.ok
+    assert result.lookups_failed == 0
+    assert len([e for e in result.errors if "spot-check not made" in e]) == 1
+    assert [ns for ns, _ in FakeClient.sessions] == ["", "svcA", "svcB", "svcB"]
 
 
 # --------------------------------------------------------------- health threshold
@@ -1018,8 +1137,6 @@ def test_staff_ok_excludes_a_stylist_with_any_failed_lookup():
 
 
 # ------------------------------------------------- who was looked for, and over what window
-MASA = "287218"                  # in the catalog, but in no FakeClient service
-
 # 02:00 UTC on Oct 13 is still 22:00 EDT on Oct 12: one of the four or five hours a day
 # when New York's date and a UTC host's (a GitHub Actions runner's) are different days.
 # Outside those hours "today" read from the host's clock is the right answer by accident,

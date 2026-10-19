@@ -46,8 +46,14 @@ event_style: blocks
 # Known: Masa, Satomi, Nao (stylists) · Sachi, Taka (Aki), Yohei, Fausto, Shin (master
 # barbers) · Hiroki (junior barber).
 # Leaving someone out does more than hide future openings: a stylist the run never looks
-# for is treated like one who has left the salon, so their existing entries are deleted on
-# the next run (still under the global mass-delete guard).
+# for is treated like one who has left the salon, so their existing entries count as
+# stale and are deleted on the next run. Narrow a few names at a time. The mass-delete
+# guard refuses a run that would delete more than half of the upcoming entries in its
+# window, and a refused run deletes NOTHING — not even the booked openings of the
+# stylists you kept, which stay advertised — and exits 1. Leaving out stylists who hold
+# most of the calendar (one name, or just Masa, Satomi and Nao) trips it on every run
+# until a one-off local `python -m src.sync_calendar --depth full --allow-mass-delete`
+# clears their entries; the workflow cannot pass that flag.
 # Staff Timely lists who are not in src/catalog.py STAFF are warned about every run and
 # skipped rather than published as "Staff 12345" — e.g. id 709526, seen once on
 # 2026-10-03 — until someone adds them there.

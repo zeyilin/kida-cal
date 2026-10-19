@@ -666,6 +666,96 @@ def test_a_deep_sweep_that_keeps_failing_does_not_starve_the_near_window(
     assert private["last_deep_sweep"] == (NOW - timedelta(hours=7)).isoformat()
 
 
+def test_a_deep_sweep_that_never_completes_still_reaches_the_issue_threshold(
+        rig, monkeypatch, gh_out):
+    """Alternating for good hid it: every near run in between exited 0 and moved last_run,
+    so last_success_age_hours stayed at 1-2h while days 22-90 and the .ics feed (only a
+    clean deep sweep republishes it) went stale, and the workflow's 12-hour issue rule
+    never fired. Once the last clean deep sweep is NEAR_FALLBACK_HOURS old every run goes
+    deep, nothing exits 0, and the age the workflow judges grows past the threshold."""
+    assert sync_calendar.NEAR_FALLBACK_HOURS == 12       # the schedule below assumes it
+    _seed_marker(rig, last_attempt=NOW - timedelta(hours=2), last_run=NOW - timedelta(hours=2),
+                 last_deep_sweep=NOW - timedelta(hours=7))
+    deep_days = mkconfig().lookahead_days
+    depths, ages = [], []
+
+    def on_fetch():
+        deep = rig["config"].lookahead_days == deep_days
+        depths.append(deep)
+        rig["result"] = _result([], ok=False) if deep else _result(_openings(hour=10))
+    rig["on_fetch"] = on_fetch
+
+    for h in range(16):
+        gh_out.write_text("")
+        _tick(rig, monkeypatch, NOW + timedelta(hours=h))
+        ages.append(float(_outputs(gh_out)["last_success_age_hours"]))
+
+    # Alternating while the clean sweep is 7-11h old; deep on every run from 12h.
+    assert depths == [True, False, True, False, True] + [True] * 11
+    assert ages[:5] == [2.0, 3.0, 1.0, 2.0, 1.0]
+    assert ages[-1] >= 12                                # STALE_ALERT_HOURS in sync.yml
+
+
+def test_the_unclean_deep_warning_says_what_the_next_run_does(
+        rig, monkeypatch, gh_out, capsys):
+    """It said the next run would sweep deep again. Since a failed deep attempt hands the
+    next auto run to near, that run swept near — the warning described a run that did not
+    happen."""
+    _seed_marker(rig, last_attempt=NOW - timedelta(hours=2), last_run=NOW - timedelta(hours=2),
+                 last_deep_sweep=NOW - timedelta(hours=7))
+    # More lost inserts than the exit floor allows, one opening a day so each is its own
+    # entry: the run exits 1 and is not clean. The next run's inserts all land.
+    n = sync_calendar.FAILURE_EXIT_FLOOR + 1
+    rig["service"].fail_plan = {("insert", None): [
+        http_error(500, "Backend Error", "backendError") for _ in range(n)]}
+    rig["result"] = _result([ev for d in range(1, n + 1)
+                             for ev in _openings(n=1, days_ahead=d, hour=10)])
+    deep_days = mkconfig().lookahead_days
+    depths = []
+    rig["on_fetch"] = lambda: depths.append(rig["config"].lookahead_days == deep_days)
+
+    first = _tick(rig, monkeypatch, NOW)
+    warned = capsys.readouterr().out
+    second = _tick(rig, monkeypatch, NOW + timedelta(hours=1))
+
+    assert (first, second) == (1, 0)
+    assert depths == [True, False]
+    assert "deep sweep did not complete cleanly" in warned
+    assert "the next auto run sweeps near" in warned
+    assert "next run will sweep deep again" not in warned
+
+
+def test_a_few_lost_far_window_writes_do_not_send_every_run_deep(rig, monkeypatch, gh_out):
+    """One write in days 22-90 that fails every time — a deterministic 400 — is under the
+    exit floor, so each deep run exits 0. Counting it as an unclean sweep anyway left
+    last_deep_sweep unstamped for good: once the last clean one was NEAR_FALLBACK_HOURS old
+    every run went deep, ~6.5x the Timely load, and since all of them exited 0 the
+    workflow's 12-hour issue rule never fired either. Only a run the exit rule fails is
+    unclean now, and the lost write waits for the next scheduled deep sweep."""
+    _seed_marker(rig, last_attempt=NOW - timedelta(hours=2), last_run=NOW - timedelta(hours=2),
+                 last_deep_sweep=NOW - timedelta(hours=7))
+    deep_days = mkconfig().lookahead_days
+    near = _openings(hour=10)
+    far = _openings(n=1, stylist="24102", days_ahead=40, hour=10)
+    (lost,) = sync_calendar.build_entries(far, mkconfig().event_style)
+    rig["service"].fail_plan = {("insert", lost.google_event_id()): [
+        http_error(400, "Bad Request", "badRequest") for _ in range(50)]}
+    depths = []
+
+    def on_fetch():
+        deep = rig["config"].lookahead_days == deep_days
+        depths.append(deep)
+        rig["result"] = _result(near + far if deep else near)
+    rig["on_fetch"] = on_fetch
+
+    codes = [_tick(rig, monkeypatch, NOW + timedelta(hours=h)) for h in range(20)]
+
+    assert codes == [0] * 20
+    # deep_sweep_every_hours apart, as if nothing had failed — not deep on every run.
+    assert depths == [h % mkconfig().deep_sweep_every_hours == 0 for h in range(20)]
+    assert lost.google_event_id() not in rig["service"].live()
+
+
 def test_a_clean_deep_sweep_leaves_auto_on_its_normal_schedule(rig, monkeypatch, gh_out):
     _seed_marker(rig, last_attempt=NOW - timedelta(hours=2),
                  last_deep_sweep=NOW - timedelta(hours=7))

@@ -11,14 +11,16 @@ red here rather than in production.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from conftest import mkconfig
 from fakes import FakeCalendarService, frozen_datetime, http_error
-from src import sync_calendar
+from src import fetch_availability, sync_calendar, timely
 from src.fetch_availability import FetchResult
 from src.models import MARKER_ID, Event, ServiceOption
 # The gate and stamp claims are about main(); test_main's rig drives it against a fake
@@ -137,6 +139,36 @@ def test_a_frozen_delete_pass_fails_every_run(rig, monkeypatch, gh_out):
     assert booked in svc.live()
 
 
+# ------------------------------------------------------------------ config.yaml: depth
+
+def _marker(**hours_ago) -> dict:
+    """A status marker whose stamps are `hours_ago` before T0."""
+    return {"id": MARKER_ID, "status": "confirmed", "summary": "checked",
+            "start": {"date": T0.date().isoformat()},
+            "end": {"date": (T0.date() + timedelta(days=1)).isoformat()},
+            "extendedProperties": {"private": {
+                k: (T0 - timedelta(hours=h)).isoformat() for k, h in hours_ago.items()}}}
+
+
+@pytest.mark.parametrize("stamps, deep", [
+    # '...it goes deep once the last deep sweep is older than deep_sweep_every_hours'
+    (dict(last_deep_sweep=3, last_attempt=1), False),
+    (dict(last_deep_sweep=7, last_attempt=1), True),
+    # 'One exception: straight after a deep sweep that did not complete ... the next run
+    # sweeps near ... and the one after retries deep.' It used to say 'whenever'.
+    (dict(last_deep_sweep=7, last_attempt=1, last_deep_attempt=1), False),
+    (dict(last_deep_sweep=8, last_attempt=1, last_deep_attempt=2), True),
+    # 'That holds only until the last clean deep sweep is 12h old.'
+    (dict(last_deep_sweep=12, last_attempt=1, last_deep_attempt=1), True),
+])
+def test_auto_depth_goes_deep_once_due_with_one_exception(stamps, deep):
+    cfg = mkconfig()
+    assert cfg.deep_sweep_every_hours == 6
+    days, got = sync_calendar.resolve_depth(cfg, "auto", _marker(**stamps), now=T0)
+    assert (days, got) == ((cfg.lookahead_days, True) if deep
+                           else (cfg.near_lookahead_days, False))
+
+
 # ------------------------------------------------------------------ compliance.md: the gate
 
 def _tick(monkeypatch, gh_out, at, *argv) -> tuple[int, dict[str, str]]:
@@ -216,3 +248,24 @@ def test_a_refused_stamp_stops_the_run_before_timely(rig, monkeypatch, gh_out):
     rig["result"] = _result(_openings())
     code, _ = _tick(monkeypatch, gh_out, NOW)
     assert (code, rig["fetches"]) == (1, 0)
+
+
+# ------------------------------------------------------- compliance.md: the stop conditions
+
+def test_every_constant_compliance_md_names_exists_with_the_value_it_quotes():
+    """compliance.md lists the stop conditions by constant name and value. It went on
+    describing MAX_CONSECUTIVE_UNANSWERED_REQUESTS (3) and MIN_UNANSWERED_STREAK_SECONDS
+    (5 minutes) after src/timely.py had dropped both, so this pins each name it quotes to a
+    constant in src/ and each `NAME` (N) to that constant's value."""
+    text = (Path(__file__).resolve().parent.parent / "docs" / "compliance.md").read_text(
+        encoding="utf-8")
+    modules = (timely, fetch_availability, sync_calendar)
+    names = set(re.findall(r"`([A-Z][A-Z0-9_]{3,})`", text)) - {
+        "KIDA_SERVICE_ACCOUNT_JSON", "KIDA_CALENDAR_ID", "KIDA_HEARTBEAT_URL", "GITHUB_TOKEN"}
+    assert names, "compliance.md names no constants; this test is looking in the wrong place"
+    for name in sorted(names):
+        assert any(hasattr(m, name) for m in modules), f"compliance.md names {name}, gone"
+    for name, number, minutes in re.findall(
+            r"`([A-Z][A-Z0-9_]{3,})` \((\d+)( minutes)?\)", text):
+        actual = next(getattr(m, name) for m in modules if hasattr(m, name))
+        assert actual == int(number) * (60 if minutes else 1), (name, number, actual)

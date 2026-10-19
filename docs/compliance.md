@@ -1,7 +1,8 @@
 # Compliance findings — Timely / KIDA NYC
 
 _Recorded during Phase 0 recon on 2026-07-17. Usage profile re-measured 2026-07-25; run
-cadence and the freshness gate described 2026-10-12._
+cadence and the freshness gate described 2026-10-12; stop conditions brought in line with
+`src/timely.py` 2026-10-19._
 
 ## robots.txt
 
@@ -36,7 +37,8 @@ Disallow: /cdn-cgi/
   POSTs we do make (`/Booking/Service`, `/Booking/StaffSelection`) only move an
   anonymous session through the funnel; nothing is reserved or submitted.
 - **Low volume.** Sequential requests, ~1 req/sec (`request_delay_seconds`), honest
-  self-identifying User-Agent, exponential backoff on 429/5xx, hard per-run request cap,
+  self-identifying User-Agent, exponential backoff on 429/5xx and on connection failures
+  and timeouts (never sooner than a `Retry-After` asks), hard per-run request cap,
   and at most one sweep started per ~50 minutes however often the workflow is
   triggered, with the few exceptions listed under "How often we look" below.
 - **No PII stored.** We persist availability (times), not people.
@@ -60,10 +62,16 @@ with how much availability actually exists, so they drift below the figures abov
 busy week; the wall clock is the stable number. Every run prints its own `requests_made`,
 so this table can be checked rather than trusted. Deep sweeps run about every 6 hours
 (`deep_sweep_every_hours`), not on every run — but that is a target, not a ceiling. A deep
-sweep that does not complete cleanly (an untrusted fetch, a lost calendar write, a refused
-delete pass) is not recorded as one, so the next run that gets past the gate is normally
-deep again: while such a condition lasts, every run can be a ~38-minute deep sweep. A
-manual `full` dispatch is always deep.
+sweep that does not complete cleanly (an untrusted fetch, more lost calendar writes than
+the run's exit floor allows, a refused delete pass) fails the run and is not recorded as
+one, so it stays due; a few lost writes under that floor are left to the next scheduled
+deep sweep. The next run that gets past the gate sweeps near instead, so that days 0–21
+stay fresh, and the one after it retries deep: while such a condition lasts, every other
+run can be a ~38-minute deep sweep. That only holds until the last clean deep sweep is 12
+hours old (`NEAR_FALLBACK_HOURS` in `src/sync_calendar.py`); from then on every run is a
+deep sweep until one completes. That is deliberate: the near runs in between succeed, so
+alternating indefinitely would keep a deep sweep that never completes from ever reaching
+the workflow's 12-hour failure-issue rule. A manual `full` dispatch is always deep.
 
 ### How often we look: the freshness gate
 
@@ -85,8 +93,9 @@ Timely is a gate in the program itself:
   long, or one cut off by the job's 120-minute timeout — can be followed at once by the
   run queued behind it (the workflow's concurrency group holds at most one), which finds
   the start stamp old enough and sweeps. When the long run was a deep sweep that did not
-  complete, that follow-on sweep is normally the short near-term one (`resolve_depth` in
-  `src/sync_calendar.py`).
+  complete, that follow-on sweep is the short near-term one (`resolve_depth` in
+  `src/sync_calendar.py`) — unless the last clean deep sweep is 12 or more hours old, when
+  it is another deep sweep (see above).
 - Net effect: at most one sweep starts per ~50 minutes however many ticks (or external
   triggers, see the README) arrive, outside the exceptions below. With every tick on time
   that works out to hourly. The ceiling is ~29 sweeps a day, against the 24 the old single
@@ -149,11 +158,28 @@ These are enforced in code, not just documented — see `src/timely.py`:
   success. "Consecutive" has now been defeated twice by call orders nobody predicted, so
   the streak above is the fast trip and this total is the guarantee: broad throttling that
   never forms a streak on any single endpoint still stops the run.
-- `MAX_RETRY_AFTER_SECONDS` (120): if Timely asks us to wait longer than this, we stop
-  rather than sleep through it. We never wait *less* than a `Retry-After` asks — including
-  the RFC 7231 HTTP-date form, which we previously could not parse and silently replaced
-  with a 2-second backoff. A `Retry-After` we cannot read at all also stops the run rather
-  than being treated as permission to retry immediately.
+- `MAX_RETRY_AFTER_SECONDS` (120): if Timely asks us to wait longer than this — on a 429 or
+  on a 5xx, since an overloaded edge says "back off" with a 503 too — we stop rather than
+  sleep through it. We never wait *less* than a `Retry-After` asks — including the RFC 7231
+  HTTP-date form, which we previously could not parse and silently replaced with a 2-second
+  backoff. A `Retry-After` we cannot read at all also stops the run rather than being
+  treated as permission to retry immediately.
+- An endpoint that stops answering — connection failures, timeouts or 5xx — is bounded by
+  the two backstops below. Each request that uses up its 5 attempts on such failures fails
+  only its own lookup, and `MIN_LOOKUP_SUCCESS_RATIO` (in `src/fetch_availability.py`)
+  decides whether the run is still trusted. There is deliberately no streak stop for
+  these: one stylist's or one service's fault, or a short window of 503s, tripped it on
+  sweeps that would have finished trusted — the comment above
+  `MAX_TRANSPORT_FAILURES_PER_RUN` in `src/timely.py` has the cases.
+- `MAX_TRANSPORT_FAILURES_PER_RUN` (50): a run-wide total of failed connection attempts and
+  timeouts (not 5xx), never cleared by any success. Each costs up to ~50 seconds, so this is
+  what stops a network that drops requests at random, without ever forming a streak, from
+  dragging a run past its job timeout.
+- `MAX_RETRY_SECONDS_PER_RUN` (40 minutes): the backstop under all of the above, in time.
+  Every failed attempt of any kind is charged what it cost — the attempt itself plus the
+  backoff or `Retry-After` wait before the next one — and the run stops rather than sleep
+  past 40 minutes of retrying in total. A host that keeps asking for long waits, or keeps
+  failing slowly, is therefore stopped even when every request eventually succeeds.
 - `max_requests_per_run`: a hard cap. Hitting it aborts the run and — importantly —
   marks the fetch untrusted, so a truncated run can never trigger calendar deletions.
 - `BudgetExhausted` deliberately bypasses the per-lookup `except` handlers, so a throttled

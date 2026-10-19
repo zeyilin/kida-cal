@@ -24,7 +24,8 @@ same pair over and over and never looked at a later service. They go to as many 
 memo-served services as the cap allows, every one of them when it covers them all, and only
 then to further pairs; never to a second day of one pair. A check that cannot be made leaves
 its pair unverified, not failed. A mismatch drops the memo for the rest of the run and marks
-the whole fetch untrusted.
+the whole fetch untrusted — unless, for a check made after the sweep, the service whose
+answer the memo holds now gives the same day as the check (see _source_agrees).
 
 Exit/guard behaviour lives here so callers get a clear success/suspicious signal:
 `FetchResult.ok` is False unless a large majority of the configured (service,staff)
@@ -307,10 +308,10 @@ def _slot_durations(raw) -> set[int]:
 
 
 # A service's memo hits, as recorded for _DedupSampler: staff_id -> {day: (duration, the
-# memoized slots that pair published for that day)}. The slots are kept by reference so a
-# later check compares against exactly what was published, even if a later service's probe
-# has since rewritten the same memo key.
-_MemoHits = dict[str, dict[str, tuple[int, list]]]
+# memoized slots that pair published for that day, the service that read them live)}. The
+# slots are kept by reference so a later check compares against exactly what was published,
+# even if a later service's probe has since rewritten the same memo key.
+_MemoHits = dict[str, dict[str, tuple[int, list, dict]]]
 
 
 class _DedupSampler:
@@ -418,14 +419,81 @@ class _DedupSampler:
         return staff_id, self._rng.choice(sorted(hits[staff_id]))
 
 
+def _starts(raw: list) -> set[int]:
+    return {s.start_min for s in raw}
+
+
 def _dedup_mismatch(svc: dict, staff_id: str, day: str, duration: int,
                     memo: list, live: list) -> str | None:
     """The error to report if a live re-fetch disagrees with what the memo published."""
-    if {s.start_min for s in live} == {s.start_min for s in memo}:
+    if _starts(live) == _starts(memo):
         return None
     return (f"dedup invariant broken for {svc['name']} / staff {staff_id} {day} "
-            f"@{duration}m: memoized {sorted(s.start_min for s in memo)} vs live "
-            f"{sorted(s.start_min for s in live)}")
+            f"@{duration}m: memoized {sorted(_starts(memo))} vs live "
+            f"{sorted(_starts(live))}")
+
+
+def _open_session(make_client, svc: dict, service_staff_ids: dict, staff_id: str):
+    """A new session through the funnel for `svc`, opened after the sweep for checks only.
+    No response cache: the only reads it makes are live ones (see _live_read)."""
+    client = make_client(cache=None, cache_ns=svc["service_id"])
+    client.bootstrap()
+    client.select_service(svc["bookable_item_id"], service_staff_ids)
+    client.select_staff(staff_id)
+    return client
+
+
+def _live_read(client, staff_id: str, day: str) -> list:
+    """One spot-check's live read of `day`, asked the way the sweep asks for a stylist's days:
+    GetOpenDates for the stylist (the check day's month only), then gettimeslots. The first
+    answer is not used; the request is made for the order's sake. Without it a check made as
+    a service's walk ends would follow another stylist's requests, and one made in a new
+    session would follow the bare funnel — orders no sweep, browser or recon capture has
+    used — and an empty day earned that way would read as a broken invariant and void the
+    run. It costs one GET per check.
+
+    Never from the response cache (a dev aid, off in CI): a GetOpenDates answered from what
+    the sweep just cached never reaches Timely, which loses the order above, and a cached
+    gettimeslots is not a live read. Dropping the cache here costs the session nothing: a
+    check is the last request of its service's walk, and a session opened after the sweep
+    makes nothing but checks."""
+    client.cache = None
+    checked = datetime.fromisoformat(day)
+    client.open_dates(staff_id, checked.month, checked.year)
+    return client.time_slots(staff_id, day)
+
+
+def _source_agrees(source: dict, svc: dict, staff_id: str, day: str, live: list,
+                   make_client, service_staff_ids: dict, errors: list[str]) -> bool:
+    """A check made after the sweep disagreed with the memo. That is not proof the
+    invariant broke: the memo holds what `source` read live, up to the whole sweep earlier
+    (~39 minutes for a deep one), and a booking or a cancellation since then changes that
+    stylist's day for every service alike. So `source` is asked again, now, in a new
+    session. If it gives the same day as the check, the two services agree and only the day
+    changed: the pair is left unverified, like one the draw passed over, and True is
+    returned. If it disagrees, or cannot be asked at all (a throttle included), the
+    mismatch stands; the caller stops there, so nothing more is sent.
+
+    Only checks made after the sweep are re-asked. One made as a walk ends trails the memo
+    by the services walked in between rather than by the rest of the sweep, so the same
+    false alarm is rarer there but still possible; a re-ask in the middle of the sweep
+    would also need its own answer to a throttle, and is not worth that."""
+    try:
+        again = _live_read(_open_session(make_client, source, service_staff_ids, staff_id),
+                           staff_id, day)
+    except Exception as e:
+        msg = f"could not re-ask {source['name']} / staff {staff_id} {day}: {e}"
+        print(f"::warning::{msg}", file=sys.stderr)
+        errors.append(msg)
+        return False
+    if _starts(again) != _starts(live):
+        return False
+    msg = (f"dedup spot-check for {svc['name']} / staff {staff_id} {day} disagreed with the "
+           f"memo, but {source['name']} now gives the same {sorted(_starts(live))}: the day "
+           f"changed during the sweep, so the pair is left unverified")
+    print(f"::warning::{msg}", file=sys.stderr)
+    errors.append(msg)
+    return True
 
 
 def _check_not_made(svc: dict, staff_id: str, day: str, e: Exception) -> str:
@@ -440,7 +508,7 @@ def _checks_stopped(e: BudgetExhausted, when: str) -> str:
     return msg
 
 
-def _make_up_checks(plan, sampler: _DedupSampler, make_client, cache,
+def _make_up_checks(plan, sampler: _DedupSampler, make_client,
                     service_staff_ids: dict, errors: list[str]) -> tuple[int, bool]:
     """Spend the checks still unspent when the sweep ends (see _DedupSampler). Returns
     (checks made, whether one found the invariant broken).
@@ -449,14 +517,13 @@ def _make_up_checks(plan, sampler: _DedupSampler, make_client, cache,
     has sat idle for the rest of the sweep, nothing in docs/timely-api.md says how long an
     obg session lives, and a stale session that answered with a well-formed empty day would
     read here as a broken invariant and void the whole run. The new session makes the
-    sweep's requests in the sweep's order: the funnel, then GetOpenDates for the stylist
-    (the check day's month only), then gettimeslots. Skipping GetOpenDates would save a GET
-    but ask gettimeslots in an order no sweep, browser or recon capture has ever used, and
-    an empty day earned that way would void the run just the same. The price is a session's
-    three setup requests (two of them the funnel POSTs) per service checked here, and one
-    GetOpenDates per check: at most 16 with the default 4 checks, against a ~2,300-request
-    sweep. Simulated against the real menu (docs/timely-api.md), about half of all runs need
-    one such session and a few need two.
+    sweep's requests in the sweep's order: the funnel, then GetOpenDates for the stylist,
+    then gettimeslots (see _live_read). The price is a session's three setup requests (two
+    of them the funnel POSTs) per service checked here, and one GetOpenDates per check: at
+    most 16 with the default 4 checks, against a ~2,300-request sweep. Simulated against the
+    real menu (docs/timely-api.md), about half of all runs need one such session and a few
+    need two. A mismatch costs one more session and two reads, to ask the service the memo
+    came from before it voids the run (see _source_agrees).
 
     Every lookup is complete by now, so nothing here can fail one. A check that cannot be
     made is reported and its pair stays unverified, like any pair the draw passed over. A
@@ -478,16 +545,9 @@ def _make_up_checks(plan, sampler: _DedupSampler, make_client, cache,
         try:
             client = sessions.get(idx)
             if client is None:
-                client = make_client(cache=cache, cache_ns=svc["service_id"])
-                client.bootstrap()
-                client.select_service(svc["bookable_item_id"], service_staff_ids)
-                client.select_staff(staff_id)
+                client = _open_session(make_client, svc, service_staff_ids, staff_id)
                 sessions[idx] = client
-            # The answer is not used: the request is made for the order's sake (see above).
-            # Each check in a session is a different stylist, so it is never asked twice.
-            checked = datetime.fromisoformat(day)
-            client.open_dates(staff_id, checked.month, checked.year)
-            live = client.time_slots(staff_id, day)
+            live = _live_read(client, staff_id, day)
         except BudgetExhausted as e:
             errors.append(_checks_stopped(e, "after the sweep"))
             break
@@ -496,8 +556,11 @@ def _make_up_checks(plan, sampler: _DedupSampler, make_client, cache,
             dead.add(idx)
             continue
         made += 1
-        duration, memo = hits[staff_id][day]
+        duration, memo, source = hits[staff_id][day]
         broken = _dedup_mismatch(svc, staff_id, day, duration, memo, live)
+        if broken and _source_agrees(source, svc, staff_id, day, live, make_client,
+                                     service_staff_ids, errors):
+            continue
         if broken:
             print(f"::error::{broken}", file=sys.stderr)
             errors.append(broken)
@@ -586,8 +649,9 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
     slots: list[Slot] = []
     ok_count = fail_count = 0
     errors: list[str] = []
-    # (staff_id, duration_min, date_iso) -> decoded slots, shared across services
-    slot_memo: dict[tuple[str, int, str], list] = {}
+    # (staff_id, duration_min, date_iso) -> (the service that read it live, decoded slots),
+    # shared across services
+    slot_memo: dict[tuple[str, int, str], tuple[dict, list]] = {}
     memo_trusted = True        # cleared for the rest of the run if a spot-check disagrees
     saved = 0
     sampler = _DedupSampler(plan, config.verify_dedup_samples, rng)
@@ -655,8 +719,8 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
                     memo_key = ((staff_id, duration, day)
                                 if duration is not None and memo_trusted else None)
                     if memo_key is not None and memo_key in slot_memo:
-                        raw = slot_memo[memo_key]
-                        pair_hits[day] = (duration, raw)
+                        source, raw = slot_memo[memo_key]
+                        pair_hits[day] = (duration, raw, source)
                         saved += 1
                     else:
                         raw = client.time_slots(staff_id, day)
@@ -664,7 +728,7 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
                         if len(durations) == 1:
                             duration = next(iter(durations))
                             if memo_trusted:
-                                slot_memo[(staff_id, duration, day)] = raw
+                                slot_memo[(staff_id, duration, day)] = (svc, raw)
                         elif durations:
                             # Mixed durations in one response: the memo key would be a lie,
                             # so don't cache and don't claim to know this pair's duration.
@@ -712,11 +776,11 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
         pick = sampler.at_walk_end(idx, svc_hits) if svc_hits else None
         if pick:
             staff_id, day = pick
-            duration, raw = svc_hits[staff_id][day]
+            duration, raw, _source = svc_hits[staff_id][day]
             # Spent before the request, so a check that errors still counts against the cap.
             sampler.spend()
             try:
-                fresh = client.time_slots(staff_id, day)
+                fresh = _live_read(client, staff_id, day)
             except BudgetExhausted as e:
                 if idx < len(plan) - 1:
                     # A stop condition mid-sweep, like any other: the run is over, and
@@ -752,12 +816,25 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
                     memo_trusted = False
                     slot_memo.clear()
 
+    # "enough" == a large majority of the planned lookups actually landed AND we actually saw
+    # data. The old rule (`ok_count > 0 and fail_count <= ok_count`) called a fetch healthy
+    # with 49% of the salon's availability missing, and the delete pass then removed all of
+    # it. Counting only exceptions is still not enough: a Timely shape change can make every
+    # lookup "succeed" with zero slots, which is the input that wipes the calendar. A salon
+    # with genuinely zero openings across the whole window is not a state we should ever
+    # publish silently, so require at least one slot before declaring health.
+    enough = (expected > 0
+              and ok_count >= MIN_LOOKUP_SUCCESS_RATIO * expected
+              and bool(slots))
+
     # Checks promised to services that turned out never to be memo-served are not lost:
     # they go to the memo-served services that were passed over (see _DedupSampler). Not
     # on an aborted run, which is mid-back-off and untrusted anyway, nor after a stop
-    # condition on the last service's check, nor once the memo has already been caught out.
-    if not aborted and not checks_stopped and memo_trusted and sampler.left:
-        made, broken = _make_up_checks(plan, sampler, make_client, cache,
+    # condition on the last service's check, nor once the memo has already been caught out,
+    # nor on a run too thin to trust whatever they find: each check here can cost a session
+    # and two of the funnel POSTs Timely rate-limits, on a run that will write nothing.
+    if enough and not aborted and not checks_stopped and memo_trusted and sampler.left:
+        made, broken = _make_up_checks(plan, sampler, make_client,
                                        service_staff_ids, errors)
         saved -= made
         if broken:
@@ -768,18 +845,8 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
     # failed" value, which leaves existing descriptions alone.
     notices = None if aborted else fetch_notices()
 
-    # "ok" == a large majority of the planned lookups actually landed AND we actually saw
-    # data. The old rule (`ok_count > 0 and fail_count <= ok_count`) called a fetch healthy
-    # with 49% of the salon's availability missing, and the delete pass then removed all of
-    # it. Counting only exceptions is still not enough: a Timely shape change can make every
-    # lookup "succeed" with zero slots, which is the input that wipes the calendar. A salon
-    # with genuinely zero openings across the whole window is not a state we should ever
-    # publish silently, so require at least one slot before declaring health.
-    ok = (expected > 0
-          and not aborted
-          and ok_count >= MIN_LOOKUP_SUCCESS_RATIO * expected
-          and memo_trusted
-          and bool(slots))
+    # ...and the sweep ran to the end, and no spot-check caught the memo out.
+    ok = enough and not aborted and memo_trusted
     if aborted:
         print(f"::error::fetch aborted mid-sweep: {aborted}", file=sys.stderr)
     if not ok:

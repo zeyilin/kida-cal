@@ -120,6 +120,9 @@ FAILURE_EXIT_FLOOR = 5          # below this many write failures, still exit 0
 FAILURE_EXIT_SHARE = 0.05
 SKIPPED_DELETE_EXIT_FLOOR = 10  # withholding a few deletes is routine; withholding many
                                 # means a stylist is stale on a public calendar
+NEAR_FALLBACK_HOURS = 12        # a failed deep sweep hands the next run to near only while
+                                # the last clean deep sweep is younger than this (see
+                                # resolve_depth)
 
 
 class WriteAborted(RuntimeError):
@@ -600,6 +603,16 @@ def resolve_depth(config: Config, requested: str, marker: dict | None,
     a handful of fully-throttled requests) often spares a ~240-request near one. Days 0-21
     then went unrefreshed, booked openings stayed advertised, and every run exited 2.
     Alternating keeps the near window fresh every other run while deep keeps being retried.
+
+    ...but only while the last clean deep sweep is under NEAR_FALLBACK_HOURS old. The near
+    runs in between exit 0, and an exit 0 is what moves last_run, so alternating for good
+    kept last_success_age_hours fresh while days 22-90 and the .ics feed (only a deep sweep
+    that exits 0 gets it published) went stale: a failure that hits deep sweeps alone — the
+    request cap, a delete pass refused on the far window — never reached the workflow's
+    12-hour issue rule. Past the limit every auto run goes deep, as before alternating
+    existed; if those keep failing nothing exits 0 (main() only leaves a deep sweep
+    unrecorded when the run exits non-zero), and that rule fires. No recorded deep sweep
+    at all counts as past it.
     """
     if requested == "near":
         return config.near_lookahead_days, False
@@ -611,10 +624,15 @@ def resolve_depth(config: Config, requested: str, marker: dict | None,
     if since is not None and since < timedelta(hours=config.deep_sweep_every_hours):
         return config.near_lookahead_days, False
     if _last_attempt_was_a_failed_deep_sweep(marker, now):
-        print("depth: a deep sweep is due, but the last run was one that did not complete; "
-              "sweeping near this time so days 0-"
-              f"{config.near_lookahead_days} stay fresh, and deep again on the next run")
-        return config.near_lookahead_days, False
+        if since is not None and since < timedelta(hours=NEAR_FALLBACK_HOURS):
+            print("depth: a deep sweep is due, but the last run was one that did not "
+                  f"complete; sweeping near this time so days 0-{config.near_lookahead_days} "
+                  f"stay fresh, and deep again on the next run")
+            return config.near_lookahead_days, False
+        age = "never recorded" if since is None else f"{since.total_seconds() / 3600:.0f}h ago"
+        print(f"depth: the last run was a deep sweep that did not complete, and the last "
+              f"clean one was {age} (limit {NEAR_FALLBACK_HOURS}h); sweeping deep on every "
+              f"run until one completes")
     return config.lookahead_days, True
 
 
@@ -1267,7 +1285,8 @@ def main(argv=None):
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--depth", choices=("auto", "near", "full"), default="auto",
                     help="auto (default) goes deep when the last deep sweep is stale, "
-                         "unless the run before was a deep sweep that did not complete")
+                         "unless the run before was a deep sweep that did not complete "
+                         f"and the last clean one is under {NEAR_FALLBACK_HOURS}h old")
     ap.add_argument("--ics", default=None, help="also write an .ics file to this path")
     ap.add_argument("--fetch-json", default=None,
                     help="write the fetch result to this path (for artifacting/replay)")
@@ -1466,8 +1485,9 @@ def main(argv=None):
     # workflow's 12-hour issue threshold was never reached, and the skipped ticks behind
     # each failure looked fresh enough to ping the heartbeat.
     failed = write_failures(stats)
+    lost = failed > max(FAILURE_EXIT_FLOOR, FAILURE_EXIT_SHARE * writes_attempted(stats))
     errors = []
-    if failed > max(FAILURE_EXIT_FLOOR, FAILURE_EXIT_SHARE * writes_attempted(stats)):
+    if lost:
         errors.append(f"::error::{failed} write failures out of {writes_attempted(stats)} "
                       f"attempted")
     # A refused delete pass already said why, as an ::error:: from sync().
@@ -1483,13 +1503,24 @@ def main(argv=None):
     if service is not None and not args.dry_run:
         now = datetime.now(tz)
         # Only a deep sweep that actually completed cleanly may claim one happened. A run
-        # that lost writes or had its delete pass refused did NOT refresh the far window,
-        # and stamping it would suppress the corrective sweep for deep_sweep_every_hours.
-        clean = write_failures(stats) == 0 and not stats["blocked_delete"]
+        # that lost more writes than the exit rule above tolerates, or had its delete pass
+        # refused, did NOT refresh the far window, and stamping it would suppress the
+        # corrective sweep for deep_sweep_every_hours.
+        #
+        # "Unclean" uses the exit rule's own test, so a deep sweep left unrecorded is always
+        # a run that exits non-zero — which is what lets resolve_depth's NEAR_FALLBACK_HOURS
+        # rule end in the workflow's issue. Calling ANY lost write unclean made one write
+        # that fails every time (a deterministic 400 in days 22-90) send every run deep
+        # after 12h: ~6.5x the Timely load, every run exiting 0, and so no issue either. A
+        # few lost writes now wait for the next scheduled deep sweep, like any change to
+        # the far window between two of them.
+        clean = not lost and not stats["blocked_delete"]
         last_deep = now if (deep and clean) else marker_last_deep_sweep(marker)
         if deep and not clean:
             print("::warning::deep sweep did not complete cleanly; not recording it as one, "
-                  "so the next run will sweep deep again")
+                  "so it stays due: the next auto run sweeps near and the one after retries "
+                  f"deep, or every run goes deep once the last clean deep sweep is "
+                  f"{NEAR_FALLBACK_HOURS}h old (see resolve_depth)")
         write_marker(service, cal_id, checked_at=now,
                      # Openings, not entries: under `blocks` an entry count would understate
                      # availability ~3.3x. And everything of ours left live, not just this

@@ -492,6 +492,95 @@ def test_a_check_made_after_the_sweep_asks_for_the_open_dates_first():
     assert result.ok                                # ...and it agreed with the memo
 
 
+def test_a_check_made_as_a_walk_ends_asks_for_the_open_dates_first_too():
+    """The same order for the check made inside the sweep. It is made once the service's
+    whole walk is done, so a check on any stylist but the last one walked used to follow
+    ANOTHER stylist's requests straight into gettimeslots — an order the sweep never uses,
+    with the same well-formed empty day voiding the run if Timely answers it that way. This
+    fake holds every check to the strictest reading: it answers gettimeslots only for the
+    stylist the session last asked GetOpenDates about."""
+    class LastDated(FakeClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.dated = None
+
+        def open_dates(self, staff_id, month, year):
+            self.dated = staff_id
+            return super().open_dates(staff_id, month, year)
+
+        def time_slots(self, staff_id, date_iso):
+            if staff_id != self.dated:
+                FakeClient.calls.append(("time_slots", self.ns, staff_id, date_iso))
+                return []
+            return super().time_slots(staff_id, date_iso)
+
+    checked = set()
+    for seed in range(10):
+        FakeClient.calls = []
+        # One check: svcB, the only memo-served service, takes it as its walk ends.
+        result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=1),
+                       client_factory=LastDated, rng=random.Random(seed))
+        assert not any("dedup invariant broken" in e for e in result.errors), seed
+        assert result.ok
+        checked |= {staff for (ns, staff), n in
+                    Counter(c[1:3] for c in _timeslot_calls()).items() if n == 2}
+    assert NAO in checked     # svcB walks Nao, then Sachi: Nao's check is the one at risk
+
+
+def test_a_spot_check_never_reads_the_response_cache(monkeypatch):
+    """The cache is a dev aid (off in CI), but with it on, the GetOpenDates a check asks
+    first was answered from what the sweep had just cached for that service and stylist —
+    it never reached Timely, so the session went from the funnel straight to gettimeslots
+    after all. A check is a live read by definition: neither of its requests may be cached."""
+    class DictCache:
+        def __init__(self, ttl_seconds=0):
+            self.d = {}
+
+        def get(self, key):
+            return self.d.get(key)
+
+        def put(self, key, value):
+            self.d[key] = value
+
+    class Cached(FakeClient):
+        """Reads through the cache as TimelyClient does, so FakeClient.calls lists only the
+        requests that reached Timely."""
+        def __init__(self, cache=None, cache_ns=""):
+            super().__init__(cache=cache, cache_ns=cache_ns)
+            self.cache = cache
+
+        def _through(self, key, send):
+            if self.cache and self.cache.get(key) is not None:
+                return self.cache.get(key)
+            out = send()
+            if self.cache:
+                self.cache.put(key, out)
+            return out
+
+        def open_dates(self, staff_id, month, year):
+            return self._through(f"od:{self.ns}:{staff_id}:{year}-{month}",
+                                 lambda: super(Cached, self).open_dates(staff_id, month, year))
+
+        def time_slots(self, staff_id, date_iso):
+            return self._through(f"ts:{self.ns}:{staff_id}:{date_iso}",
+                                 lambda: super(Cached, self).time_slots(staff_id, date_iso))
+
+    monkeypatch.setattr(fa, "ResponseCache", DictCache)
+    # Two checks on svcB: one as its walk ends, one after the sweep (session 4).
+    result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=2),
+                   client_factory=Cached, rng=random.Random(0))
+
+    assert result.ok
+    sent = FakeClient.calls
+    checks = [i for i, c in enumerate(sent) if c[0] == "time_slots" and c[1] == "svcB"
+              and sum(1 for d in sent[:i] if d[:3] == c[:3]) == 1]   # past the probe
+    assert len(checks) == 2
+    for i in checks:
+        _, _, staff, day = sent[i]
+        when = date.fromisoformat(day)
+        assert sent[i - 1] == ("open_dates", "svcB", staff, when.year, when.month)
+
+
 def test_a_check_that_cannot_be_made_is_reported_not_charged_as_a_failed_lookup():
     """A spot-check re-reads one day of a pair whose lookup already completed. If that
     request fails, the pair is exactly as good as one the draw never picked. It used to run
@@ -537,29 +626,36 @@ def test_a_throttle_after_the_sweep_stops_the_checks_but_does_not_abort_the_run(
     assert len(FakeClient.sessions) == 7
 
 
-def test_a_throttle_on_an_in_sweep_check_still_aborts_the_sweep():
-    """Unlike a check after the sweep, this one has services still to walk."""
+@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("culprit", ["s2", "s4"])
+def test_a_throttle_on_an_in_sweep_check_still_aborts_the_sweep(culprit, seed):
+    """Unlike a check after the sweep, this one has services still to walk. s4 is the
+    boundary of the last-service rule below: second to last, with only s5 left — an
+    off-by-one there would treat it as the last and keep a run that never walked s5."""
     class ThrottledCheck(FiveCuts):
         def time_slots(self, staff_id, date_iso):
-            if self.ns == "s2" and date_iso != _open_days()[0]:
-                # s2 is memo-served: past its probe day, every request it makes is a check.
+            if self.ns == culprit and date_iso != _open_days()[0]:
+                # Memo-served: past its probe day, every request it makes is a check.
                 raise BudgetExhausted("cap reached")
             return super().time_slots(staff_id, date_iso)
 
     FiveCuts.diverge = set()
+    # 4 checks for 4 memo-served services: each takes one as its walk ends, whatever the draw.
     result = fetch(mkconfig(lookahead_days=10, verify_dedup_samples=4),
-                   client_factory=ThrottledCheck, rng=random.Random(0))
+                   client_factory=ThrottledCheck, rng=random.Random(seed))
 
+    later = [f"s{i}" for i in range(int(culprit[1]) + 1, 6)]
     assert result.ok is False
     assert any("run aborted" in e for e in result.errors)
     assert result.staff_ok == set()
-    assert not any(c[1] in ("s3", "s4", "s5") for c in _timeslot_calls())
-    # Nor is anything sent after it. Three checks are still unspent and s2's other pair is
-    # still unchecked, but a stop condition means stop: no make-up session for it either.
+    assert not any(c[1] in later for c in _timeslot_calls())
+    # Nor is anything sent after it. Checks are still unspent and the culprit's other pair
+    # is still unchecked, but a stop condition means stop: no make-up session for it either.
     # (Only the request cap in src/timely.py is sticky. A throttle stop raises on the
     # request that completes the streak and lets the next one go out, so this holds only
     # because fetch() stops asking.)
-    assert [ns for ns, _ in FakeClient.sessions] == ["", "s1", "s2"]
+    assert [ns for ns, _ in FakeClient.sessions] == \
+        ["", *(f"s{i}" for i in range(1, int(culprit[1]) + 1))]
 
 
 def test_no_check_is_made_after_a_sweep_that_aborted_in_a_funnel_setup():
@@ -580,6 +676,20 @@ def test_no_check_is_made_after_the_memo_was_caught_out():
 
     assert result.ok is False
     assert any("dedup invariant broken for Cut 2" in e for e in result.errors)
+    assert len(FakeClient.sessions) == 6        # the probe and s1..s5; nothing after
+
+
+def test_no_check_is_made_after_a_sweep_too_thin_to_be_trusted():
+    """s1 and s2 fail their funnel setup: 6 of 10 lookups land, under the 80% the run needs,
+    so it is untrusted whatever a check finds. s3 walks; s4 and s5 are served from its memo
+    and take a check each as their walks end, leaving six checks for their other two pairs
+    after the sweep — a session and two of the funnel POSTs Timely rate-limits apiece, on a
+    run that writes nothing."""
+    FakeClient.fail_setup_for = {"s1", "s2"}
+    result, _ = _five_cuts(0, budget=8)
+
+    assert result.lookups_ok == 6 and result.lookups_expected == 10
+    assert result.ok is False
     assert len(FakeClient.sessions) == 6        # the probe and s1..s5; nothing after
 
 
@@ -632,6 +742,69 @@ def test_a_service_whose_make_up_session_would_not_open_is_not_tried_again():
     assert result.lookups_failed == 0
     assert len([e for e in result.errors if "spot-check not made" in e]) == 1
     assert [ns for ns, _ in FakeClient.sessions] == ["", "svcA", "svcB", "svcB"]
+
+
+class BookedLate(FakeClient):
+    """Every session from `booked_from` on sees each day with its 10:00 opening gone — what
+    a booking made while the sweep ran looks like, to every service alike. `split` services
+    lose the 11:00 opening instead: a genuine divergence, showing only after the sweep."""
+    booked_from = 4               # 0 probe, 1 svcA, 2 svcB, 3 svcC: the first session after
+    split: set = set()
+
+    def time_slots(self, staff_id, date_iso):
+        slots = super().time_slots(staff_id, date_iso)
+        if self.n < self.booked_from:
+            return slots
+        gone = 660 if self.ns in self.split else 600
+        return [s for s in slots if s.start_min != gone]
+
+
+def _booked_late(split=()):
+    BookedLate.split = set(split)
+    # Two checks on svcB: one as its walk ends, one after the sweep in session 4.
+    return fetch(mkconfig(lookahead_days=10, verify_dedup_samples=2),
+                 client_factory=BookedLate, rng=random.Random(0))
+
+
+def test_a_booking_during_the_sweep_does_not_void_the_run_at_a_check_after_it():
+    """A check made after the sweep compares a live day with what the memo's service read
+    up to the whole sweep earlier (~39 minutes for a deep one). A booking in between changes
+    the day for every service alike, and read as a broken invariant it voided a run whose
+    every lookup landed. The service whose answer the memo holds is asked again: it now
+    agrees with the check, so the services agree and only the day changed."""
+    result = _booked_late()
+
+    assert result.ok
+    assert not any("dedup invariant broken" in e for e in result.errors)
+    assert any("the day changed during the sweep" in e for e in result.errors)
+    # svcA, whose answer the memo held, was asked through a session of its own.
+    assert [ns for ns, _ in FakeClient.sessions] == ["", "svcA", "svcB", "svcC", "svcB",
+                                                     "svcA"]
+    assert FakeClient.sessions[5][1] == ["bootstrap", "service", "staff"]
+
+
+def test_a_divergence_seen_after_the_sweep_still_voids_the_run():
+    """The re-ask must not wave a real break through: after the sweep svcB answers only
+    10:00 and svcA, whose answer the memo held, only 11:00."""
+    result = _booked_late(split={"svcB"})
+
+    assert result.ok is False
+    assert any("dedup invariant broken for Hair Cut Deluxe" in e for e in result.errors)
+
+
+@pytest.mark.parametrize("fail", ["session", "throttle"])
+def test_a_re_ask_that_cannot_be_made_leaves_the_mismatch_standing(fail):
+    """No answer is not agreement: the run stays untrusted, and nothing more is sent."""
+    if fail == "session":
+        FakeClient.fail_sessions = {5}
+    else:
+        FakeClient.budget_error_sessions = {5}
+    result = _booked_late()
+
+    assert result.ok is False
+    assert any("dedup invariant broken for Hair Cut Deluxe" in e for e in result.errors)
+    assert any("could not re-ask Hair Cut" in e for e in result.errors)
+    assert len(FakeClient.sessions) == 6
 
 
 # --------------------------------------------------------------- health threshold

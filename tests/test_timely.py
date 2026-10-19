@@ -5,12 +5,10 @@ No network. A scripted fake stands in for requests.Session and plays back one ou
 per ATTEMPT — a status code, or an exception to raise — so a test states exactly which
 attempt failed and how.
 """
-import base64
 import json
 import os
-import random
+import uuid
 from datetime import datetime, timedelta
-from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -30,8 +28,6 @@ def _open_dates_url(obg=OBG, staff="175308"):
 
 
 URL = _open_dates_url()
-SLOTS_URL = (f"{timely.BASE}/booking/gettimeslots/?obg={OBG}&dateSelected=2026-09-12"
-             f"&staffId=175308&tzName=&tzId=80")
 
 
 def _read(name):
@@ -137,19 +133,18 @@ TRANSPORT_ERRORS = [
     pytest.param(lambda: requests.Timeout("timed out"), id="bare-timeout"),
 ]
 
-# Attempts that get no USABLE answer, which the unanswered streak counts alike: (a factory
-# for one attempt's outcome, the seconds each attempt takes, what the stop message must
-# name). Each is slow enough — a 30s read timeout, or a 5xx asking for a 60s wait — that a
-# request spending all five attempts on it lasts 3-4 min, so three of them outlast
-# MIN_UNANSWERED_STREAK_SECONDS and only the streak's other conditions are in play.
+# Attempts that get no USABLE answer: (a factory for one attempt's outcome, the seconds
+# each attempt takes). A request spending all five attempts on one lasts ~3 min (30s read
+# timeouts), ~4 min (a 5xx asking for a 60s wait) or ~30s (a fast 5xx: backoff alone).
 UNANSWERED = [
-    pytest.param(_timeout, 30.0, "ReadTimeout: Read timed out", id="read-timeout"),
-    pytest.param(lambda: FakeResponse(503, headers={"Retry-After": "60"}), 0.3, "HTTP 503",
-                 id="503"),
-    pytest.param(lambda: FakeResponse(502, headers={"Retry-After": "60"}), 0.3, "HTTP 502",
-                 id="502"),
+    pytest.param(_timeout, 30.0, id="read-timeout"),
+    pytest.param(lambda: FakeResponse(503, headers={"Retry-After": "60"}), 0.3,
+                 id="503-retry-after-60"),
+    pytest.param(lambda: FakeResponse(503), 0.3, id="fast-503"),
+    pytest.param(lambda: FakeResponse(502), 0.3, id="fast-502"),
 ]
 HIROKI = "686999"     # sole stylist of the catalog's last six services
+HIROKI_SERVICES = ["5319831", "5319834", "5319836", "5319837", "5319841", "5319844"]
 FAUSTO = "24105"      # in nine services, interleaved with other stylists
 
 
@@ -192,20 +187,17 @@ def test_transport_failures_never_trip_the_throttle_stop_conditions(slept):
     otherwise healthy sweep as untrusted — and the run-wide backstop would make even
     scattered network blips fatal.
 
-    Transport failures have stop conditions of their own (tested below), so the failed
-    requests are spread over enough endpoints that no transport streak reaches its
-    threshold and the run-wide transport total stays under its cap: with those out of the
-    way, none of these requests may end the run."""
+    Transport failures have a run-wide cap of their own (tested below), so the failed
+    attempts stay under it: with that out of the way, none of these requests — all to one
+    endpoint, the case the per-endpoint throttle streak trips on — may end the run."""
     n = max(timely.MAX_CONSECUTIVE_THROTTLES, timely.MAX_THROTTLED_REQUESTS_PER_RUN) + 1
-    per_endpoint = timely.MAX_CONSECUTIVE_UNANSWERED_REQUESTS - 1
-    endpoints = [URL, SLOTS_URL, timely.EMBED]
-    assert per_endpoint * len(endpoints) >= n and 5 * n < timely.MAX_TRANSPORT_FAILURES_PER_RUN
+    assert 5 * n < timely.MAX_TRANSPORT_FAILURES_PER_RUN
     session = FakeSession(*[_timeout() for _ in range(5 * n)])
     c = _client(session)
 
-    for i in range(n):
+    for _ in range(n):
         with pytest.raises(TimelyError) as ei:
-            c._request("GET", endpoints[i // per_endpoint])
+            c._request("GET", URL)
         assert not isinstance(ei.value, BudgetExhausted)
     assert timely.BUDGET.throttled_total == 0
     assert not any(timely.BUDGET.throttles.values())
@@ -237,164 +229,56 @@ def test_transport_errors_and_5xx_share_one_attempt_limit_and_backoff(slept):
     assert slept == [2.0, 4.0, 8.0, 16.0]
 
 
-# ------------------------------------- ...but a host that stops answering ends the run
-def _exhaust(clock, make_outcome, latency, staff, *, call="open_dates"):
-    """One request from a FRESH client — fetch() opens one per service — that spends all
-    five attempts on `make_outcome()`, through the real client method so the stylist it
-    names reaches the stop conditions the way production's does. Returns what it raised."""
+# --------------------------- ...an exhausted request fails its lookup, never the whole run
+def _exhaust(clock, make_outcome, latency, staff):
+    """One gettimeslots request from a FRESH client — fetch() opens one per service — that
+    spends all five attempts on `make_outcome()`, through the real client method. Returns
+    what it raised."""
     c = _client(FakeSession(*[make_outcome() for _ in range(5)], clock=clock,
                             latency=latency))
-    c.obg = f"{c.session_no:08d}" + OBG[8:]          # a fresh obg, as each session has
+    c.obg = str(uuid.uuid4())                       # a fresh obg, as each session has
     with pytest.raises(TimelyError) as ei:
-        if call == "open_dates":
-            c.open_dates(staff, 9, 2026)
-        elif call == "time_slots":
-            c.time_slots(staff, "2026-09-12")
-        else:
-            c.select_staff(staff)
+        c.time_slots(staff, "2026-09-12")
     assert len(c.session.calls) == 5
     return ei.value
 
 
-@pytest.mark.parametrize("make_outcome, latency, named", UNANSWERED)
-def test_an_endpoint_that_never_answers_stops_the_run(clock, make_outcome, latency, named):
-    """Retrying transport errors made each request against a host that never answers cost
-    ~3 min instead of ~30s, and nothing stopped the sweep: one hung endpoint took 5x the
-    requests and pushed a deep sweep past the job's 120-min timeout. A few requests that
-    each spent every attempt — for different stylists, from different sessions, over more
-    than a blip's worth of time — are proof enough that the endpoint is down: the run must
-    stop as untrusted (BudgetExhausted), not grind on. Each request carries a fresh obg,
-    as real lookups do, so the streak has to be keyed on the path.
+@pytest.mark.parametrize("make_outcome, latency", UNANSWERED)
+def test_exhausted_requests_each_fail_one_lookup_and_never_stop_the_run(clock, make_outcome,
+                                                                         latency):
+    """A request that spends all five attempts without a usable answer fails its one lookup
+    — a plain TimelyError — however many follow it, for however many stylists and
+    sessions, over however long. A streak of them used to stop the run, and even once it
+    had to span two stylists, two sessions and five minutes it aborted (exit 2, nothing
+    written) sweeps that otherwise stayed trusted: a 6-min window of fast 503s on
+    gettimeslots at ~15 simulated min, and a 16-min one with Retry-After: 60 at ~22 —
+    sweeps which without the streak lost 8 and 3 of 60 lookups. Ending a hopeless run is
+    the run-wide backstops' job — every permanent outage reaches one inside the job
+    timeout (the sweep tests below) — and judging the rest is MIN_LOOKUP_SUCCESS_RATIO's.
 
-    An endpoint answering nothing but 5xx is the same outage. It used to count toward no
-    stop condition at all: each request spent its five attempts and raised a plain
-    TimelyError, and the sweep ground through every lookup."""
-    k = timely.MAX_CONSECUTIVE_UNANSWERED_REQUESTS
-    for i in range(k - 1):
-        e = _exhaust(clock, make_outcome, latency, staff=str(i))
-        assert not isinstance(e, BudgetExhausted)              # one lookup lost; run goes on
-    e = _exhaust(clock, make_outcome, latency, staff="9")
-    assert isinstance(e, BudgetExhausted)
-    assert f"{k} consecutive GET /booking/getopendates" in str(e)
-    assert f"for {k} stylists, from {k} sessions" in str(e)
-    assert named in str(e)                                      # says what the failure was
-    assert clock.now >= timely.MIN_UNANSWERED_STREAK_SECONDS
-    assert timely.BUDGET.throttled_total == 0                   # still not a throttle
-
-
-# The unanswered streak's rule, fed straight to BUDGET.unanswered(): one exhausted request
-# per (stylist, session), back to back, each lasting `minutes_each`.
-def _streak(clock, requests, *, url=URL, minutes_each=3.0):
-    """Returns the 1-based index of the request that stopped the run, or None."""
-    for i, (staff, session) in enumerate(requests, 1):
-        since = clock.now
-        clock.now += minutes_each * 60
-        try:
-            timely.BUDGET.unanswered("GET", url, "HTTP 500", staff=staff, session=session,
-                                     since=since)
-        except BudgetExhausted:
-            return i
-    return None
-
-
-def test_one_stylists_outage_never_stops_the_run(clock):
-    """The catalog's last six services are Hiroki's alone, and nothing else calls the
-    stylist endpoints between them, so a fault confined to him — Timely 500ing or timing
-    out on anything about one corrupt roster — exhausted three of his requests in a row.
-    "Three consecutive" read that as the endpoint being down and aborted the run (exit 2,
-    nothing written for any of the nine stylists) on every run after, where before these
-    stop conditions it cost his 6 of 60 lookups and stayed trusted. However long it goes
-    on, and across however many sessions, one stylist's streak is that stylist's fault."""
-    hiroki_only = [(HIROKI, session) for session in range(1, 7)]
-
-    assert _streak(clock, hiroki_only) is None
-    # ...which is not a blind spot: once a second stylist fails too, it is the endpoint.
-    assert _streak(clock, [(FAUSTO, 7)]) == 1
-
-
-def test_one_services_outage_never_stops_the_run(clock):
-    """The same, one level up. A service whose own setup makes GetOpenDates throw fails
-    every one of its stylists' requests back to back, all from that service's session —
-    five stylists in a row for Haircut — while every other service is fine."""
-    haircut = [(staff, 1) for staff in ["24102", "173532", "24107", FAUSTO, "24104"]]
-
-    assert _streak(clock, haircut) is None
-    assert _streak(clock, [("24102", 2)]) == 1
-
-
-def test_a_streak_of_fast_failures_must_outlast_a_blip(clock):
-    """A 5xx with no Retry-After fails in a fraction of a second, so three exhausted
-    requests took ~105s and a two-minute 503 window on gettimeslots (an app pool
-    recycling) aborted a sweep that otherwise lost 3 lookups and stayed trusted. A streak
-    only trips once it has lasted MIN_UNANSWERED_STREAK_SECONDS."""
-    diverse = [(str(i), i) for i in range(1, 40)]
-    blip = diverse[:4]                                           # 4 x 30s = 2 min
-
-    assert _streak(clock, blip, minutes_each=0.5) is None
-    timely.BUDGET.configure(1000, 0.0)
-    minimum = timely.MIN_UNANSWERED_STREAK_SECONDS
-    assert _streak(clock, diverse, minutes_each=0.5) == minimum // 30
-
-
-def test_requests_that_name_no_stylist_are_never_one_stylists_fault(clock):
-    """The bootstrap GET and the /Booking/Service POST are about no stylist, so a streak of
-    them is never excused as one stylist's outage — only the session and time rules apply."""
-    assert _streak(clock, [(None, s) for s in (1, 2, 3)], url=timely.EMBED) == 3
-
-
-@pytest.mark.parametrize("call", ["select_staff", "open_dates", "time_slots"])
-def test_every_stylist_request_names_its_stylist(clock, call):
-    """The rule above is only as good as its input: each request that is about a stylist
-    must say which one, or every streak looks like many stylists' (or none's) and one
-    stylist's outage aborts the run again. Six of Hiroki's requests in a row, one per
-    session as fetch() makes them, must not stop the run."""
-    for _ in range(6):
-        e = _exhaust(clock, _timeout, 30.0, staff=HIROKI, call=call)
-        assert not isinstance(e, BudgetExhausted), e
-    assert clock.now >= timely.MIN_UNANSWERED_STREAK_SECONDS
-
-
-@pytest.mark.parametrize("make_outcome, latency, named", UNANSWERED)
-def test_a_siblings_success_does_not_reset_the_unanswered_streak(clock, make_outcome, latency,
-                                                                 named):
-    """Every gettimeslots call is preceded by a GetOpenDates call. If that sibling's success
-    cleared the streak, it would oscillate 0->1->0 and never trip — the exact way the
-    throttle streak was defeated twice (see MAX_CONSECUTIVE_THROTTLES)."""
-    k = timely.MAX_CONSECUTIVE_UNANSWERED_REQUESTS
-    for i in range(k):
-        staff = str(i)
+    Here: at least eight gettimeslots requests, over at least six simulated minutes, each
+    for a different stylist from its own session after a healthy GetOpenDates, as the
+    sweep makes them."""
+    n = 0
+    while n < 8 or clock.now < 6 * 60:
+        staff = str(n)
         assert _client(FakeSession(200, body='{"openDates": []}')).open_dates(
             staff, 9, 2026) == []                                # GetOpenDates is healthy
-        e = _exhaust(clock, make_outcome, latency, staff, call="time_slots")
-        assert isinstance(e, BudgetExhausted) == (i == k - 1)    # gettimeslots never answers
-
-
-@pytest.mark.parametrize("make_outcome, latency, named", UNANSWERED)
-def test_the_endpoints_own_success_resets_its_unanswered_streak(clock, make_outcome, latency,
-                                                                named):
-    """The other half: "consecutive" means consecutive. An endpoint that answers again has
-    recovered, so bad requests either side of a good one must not end the run — even
-    though, uncleared, these would be a streak long enough, diverse enough and slow
-    enough to trip."""
-    k = timely.MAX_CONSECUTIVE_UNANSWERED_REQUESTS
-    for i in range(k - 1):
-        assert not isinstance(_exhaust(clock, make_outcome, latency, str(i)), BudgetExhausted)
-    assert _client(FakeSession(200, body='{"openDates": []}')).open_dates("x", 9, 2026) == []
-    for i in range(k - 1):
-        e = _exhaust(clock, make_outcome, latency, str(10 + i))
-        assert not isinstance(e, BudgetExhausted)
-    assert 2 * (k - 1) >= k and clock.now >= timely.MIN_UNANSWERED_STREAK_SECONDS
+        e = _exhaust(clock, make_outcome, latency, staff)
+        assert type(e) is TimelyError, e                         # one lookup lost; run goes on
+        n += 1
+    assert timely.BUDGET.throttled_total == 0
 
 
 @pytest.mark.parametrize("make_exc", TRANSPORT_ERRORS)
 def test_transport_failures_that_keep_recovering_still_stop_the_run_at_the_run_wide_cap(
         slept, make_exc):
-    """A network losing a request in twenty at random never forms a streak — every
-    request recovers on its retry — yet each failed attempt still costs a 30s timeout plus
-    backoff, and a simulated deep sweep at that rate ran ~126 min, past the job timeout.
-    So every failed transport ATTEMPT counts toward a run-wide total that no success
-    clears, and the run stops at the failure that reaches it rather than spending another
-    retry."""
+    """A network losing a request in twenty at random fails almost no request outright —
+    every request recovers on its retry — yet each failed attempt still costs a 30s
+    timeout plus backoff, and a simulated deep sweep at that rate ran ~126 min, past the
+    job timeout. So every failed transport ATTEMPT counts toward a run-wide total that no
+    success clears, and the run stops at the failure that reaches it rather than spending
+    another retry."""
     cap = timely.MAX_TRANSPORT_FAILURES_PER_RUN
     script = []
     for _ in range(cap):
@@ -436,7 +320,7 @@ def test_5xx_attempts_never_count_toward_the_transport_cap(slept, status):
         assert c._request("GET", URL) == "ok"
     for _ in range(9):
         with pytest.raises(TimelyError) as ei:
-            c._request("GET", _open_dates_url(staff=FAUSTO), staff=FAUSTO)
+            c._request("GET", _open_dates_url(staff=FAUSTO))
         assert not isinstance(ei.value, BudgetExhausted)
         assert c._request("GET", URL) == "ok"         # the next stylist answers
     assert timely.BUDGET.transport_failures == 0
@@ -445,19 +329,14 @@ def test_5xx_attempts_never_count_toward_the_transport_cap(slept, status):
     assert session.script == []
 
 
-def test_configure_resets_the_unanswered_and_retry_time_counters(monkeypatch):
+def test_configure_resets_the_transport_and_retry_time_counters(monkeypatch):
     """Like the throttle counters: a second fetch() in the same process (near tier, then
-    deep tier) must not inherit the first run's streaks, totals or spent retry time and
-    abort at once."""
-    streak = timely._UnansweredStreak(since=0.0, requests=2, staff={"1", "2"},
-                                      sessions={1, 2})
-    monkeypatch.setattr(timely.BUDGET, "unanswered_streaks",
-                        {("GET", "/booking/getopendates"): streak})
+    deep tier) must not inherit the first run's totals or spent retry time and abort at
+    once."""
     monkeypatch.setattr(timely.BUDGET, "transport_failures", 49)
     monkeypatch.setattr(timely.BUDGET, "retry_seconds", timely.MAX_RETRY_SECONDS_PER_RUN)
     timely.BUDGET.configure(1000, 0.0)
 
-    assert timely.BUDGET.unanswered_streaks == {}
     assert timely.BUDGET.transport_failures == 0
     assert timely.BUDGET.retry_seconds == 0
 
@@ -536,8 +415,8 @@ class _SweepTimely:
     """A healthy Timely, served from the captured fixtures, except that each request to
     the endpoint whose url contains `endpoint` is answered by `misbehave(self, method,
     url)` instead — which may raise, return a FakeResponse, or return None to answer
-    healthily after all. Shared by every client of the sweep so it can count what that
-    endpoint received."""
+    healthily after all (the request's form, if any, is `self.data` meanwhile). Shared by
+    every client of the sweep so it can count what that endpoint received."""
 
     def __init__(self, clock, open_day, endpoint, misbehave):
         self.clock, self.open_day = clock, open_day
@@ -549,6 +428,7 @@ class _SweepTimely:
         self.empty_day = _read("gettimeslots_empty_2026-07-22.html")
 
     def request(self, method, url, **kw):
+        self.data = kw.get("data") or {}
         if self.endpoint in url:
             self.misbehaved_requests += 1
             resp = self.misbehave(self, method, url)
@@ -592,28 +472,13 @@ def _sweep(monkeypatch, endpoint, misbehave):
     return res, clock.now / 60, timely_
 
 
-SWEEP_ENDPOINTS = ["/Booking/StaffSelection?", "/Booking/GetOpenDates?",
+SWEEP_ENDPOINTS = ["/Booking/Service?", "/Booking/StaffSelection?", "/Booking/GetOpenDates?",
                    "/booking/gettimeslots/"]
 
 
 def _hang(timely_, method, url):
     timely_.clock.now += 30.0                    # sits out the full read timeout
     raise _timeout()
-
-
-# How many requests a black-holed endpoint gets before the unanswered streak stops the
-# run: the first request at which the streak names a second stylist AND comes from a
-# second session. At ~3 min a request, MIN_UNANSWERED_STREAK_SECONDS is long past by then.
-HUNG_REQUESTS = {
-    # fetch() POSTs StaffSelection for each service's FIRST eligible stylist — Masa for
-    # the catalog's first nine services — so until the tenth (Haircut: 24102) a hung
-    # endpoint is indistinguishable from a fault in Masa's roster.
-    "/Booking/StaffSelection?": 10,
-    # The first service has three stylists, all in its one session; the second
-    # service's first request is the one that rules out one service's fault.
-    "/Booking/GetOpenDates?": 4,
-    "/booking/gettimeslots/": 4,
-}
 
 
 @pytest.mark.parametrize("hung", SWEEP_ENDPOINTS)
@@ -624,18 +489,18 @@ def test_one_hung_endpoint_ends_the_sweep_untrusted_well_inside_the_job_timeout(
     condition every lookup spent ~3 min on that endpoint: ~185 simulated min, 300 requests
     to the hung endpoint, and GitHub killing the job at 120 min with no fetch artifact.
     It must instead end as a clean untrusted fetch (exit 2 downstream), stopped by the
-    streak as soon as the outage can no longer be one stylist's or one service's — ~3 min
-    a request, long before the retry-time budget would have to."""
+    run-wide transport cap: its 50th failed attempt is the hung endpoint's tenth request,
+    ~3 min a request, before the retry-time budget would have to."""
     res, minutes, timely_ = _sweep(monkeypatch, hung, _hang)
 
-    n = HUNG_REQUESTS[hung]
-    assert minutes < 3.5 * n, (f"sweep took {minutes:.0f} simulated min and sent the hung "
-                               f"endpoint {timely_.misbehaved_requests} requests")
+    cap = timely.MAX_TRANSPORT_FAILURES_PER_RUN
+    assert minutes < 3.5 * cap / 5, (f"sweep took {minutes:.0f} simulated min and sent the "
+                                     f"hung endpoint {timely_.misbehaved_requests} requests")
     assert minutes < timely.MAX_RETRY_SECONDS_PER_RUN / 60
-    assert timely_.misbehaved_requests == 5 * n
+    assert timely_.misbehaved_requests == cap
     assert res.ok is False
     assert res.staff_ok == set(), "an aborted sweep grants delete authority over nobody"
-    assert any("run aborted" in e and f"{n} consecutive" in e and "not answering" in e
+    assert any("run aborted" in e and f"{cap} connection failures/timeouts" in e
                for e in res.errors), res.errors
 
 
@@ -649,10 +514,9 @@ def test_one_endpoint_answering_only_503_ends_the_sweep_well_inside_the_job_time
     ran ~126 min at Retry-After: 30, ~246 at 60 and ~486 at 120: past the 120-min job
     timeout, with no fetch artifact and the sync concurrency group held for two hours.
     It must end untrusted inside the job timeout whichever endpoint it is and whatever
-    Retry-After it sends: by the streak once the outage has outlasted a blip across two
-    stylists and two sessions, or by the retry-time budget when the waits get there
-    first (Masa's nine StaffSelection POSTs at 4-8 min each). Fast 503s with no
-    Retry-After are the streak's to stop, within minutes."""
+    Retry-After it sends: by the retry-time budget once the waits have used it up, or —
+    fast 503s with no Retry-After, ~30s of backoff a request — by running out of lookups,
+    every one of them failed."""
     headers = {"Retry-After": retry_after} if retry_after else {}
 
     def answer_503(timely_, method, url):
@@ -664,16 +528,122 @@ def test_one_endpoint_answering_only_503_ends_the_sweep_well_inside_the_job_time
     assert minutes < timely.MAX_RETRY_SECONDS_PER_RUN / 60 + 5, (
         f"sweep took {minutes:.0f} simulated min and sent the 503ing endpoint "
         f"{timely_.misbehaved_requests} requests")
-    # Never the 300 a full sweep used to send it: at most the ten StaffSelection needs.
-    assert timely_.misbehaved_requests <= 5 * HUNG_REQUESTS["/Booking/StaffSelection?"]
     assert res.ok is False
-    assert res.staff_ok == set(), "an aborted sweep grants delete authority over nobody"
-    assert any("run aborted" in e and ("not answering" in e and "HTTP 503" in e
-                                       or "retry budget" in e)
-               for e in res.errors), res.errors
+    assert res.lookups_ok == 0
+    assert res.staff_ok == set(), "a sweep that saw nothing grants delete authority to nobody"
     if retry_after is None:
-        assert minutes < 10
-        assert any("not answering" in e for e in res.errors), res.errors
+        assert not any("run aborted" in e for e in res.errors), res.errors
+    else:
+        assert any("run aborted" in e and "retry budget" in e and "HTTP 503" in e
+                   for e in res.errors), res.errors
+
+
+def _about_hiroki(step, timely_, url):
+    """Is this request, at funnel `step`, about Hiroki? The /Booking/Service POST of his
+    six services, or any of the three requests that name him."""
+    if step == "/Booking/Service?":
+        return timely_.data.get("BookableTimeSlotItemIds") in {f"{s}:SV"
+                                                                for s in HIROKI_SERVICES}
+    if step == "/Booking/StaffSelection?":
+        return timely_.data.get("SelectedStaffId") == HIROKI
+    return f"staffId={HIROKI}&" in url
+
+
+@pytest.mark.parametrize("fails_with", ["timeout", "500"])
+@pytest.mark.parametrize("step", SWEEP_ENDPOINTS)
+def test_a_fault_confined_to_one_stylist_never_stops_the_sweep(monkeypatch, step, fails_with):
+    """End to end, at every step of his funnel: Timely timing out, or 500ing, on every
+    request about Hiroki — sole stylist of the catalog's last six services — while every
+    other stylist is fine. A streak of consecutive exhausted requests, while there was
+    one, was his alone to fill at each step, so the run aborted (exit 2, nothing written
+    for anyone), and being deterministic, so did every run after it. It must cost his
+    lookups and nothing else: the sweep completes, and Hiroki alone loses delete
+    authority."""
+    def fault(timely_, method, url):
+        if not _about_hiroki(step, timely_, url):
+            timely_.misbehaved_requests -= 1                 # count only his requests
+            return None
+        if fails_with == "500":
+            timely_.clock.now += 0.3
+            return FakeResponse(500, "Internal Server Error")
+        return _hang(timely_, method, url)
+
+    res, _, timely_ = _sweep(monkeypatch, step, fault)
+
+    assert not any("run aborted" in e for e in res.errors), res.errors
+    assert timely_.misbehaved_requests == 5 * 6               # his six, every attempt
+    assert res.lookups_failed == 6
+    assert res.lookups_ok == res.lookups_expected - 6
+    assert HIROKI not in res.staff_ok
+    assert res.staff_ok == res.staff_planned - {HIROKI}
+
+
+@pytest.mark.parametrize("endpoint", SWEEP_ENDPOINTS + ["/book/embed"])
+def test_a_two_minute_503_window_never_stops_the_sweep(monkeypatch, endpoint):
+    """A fast 5xx fails in a fraction of a second, and the stop conditions were sized on
+    30s timeouts: three exhausted requests (~2 min of 503s, an app pool recycling) filled
+    the unanswered-request streak there once was and aborted sweeps that lost a few
+    lookups and stayed trusted. End to end, on every endpoint, such a window costs the
+    lookups it costs and no more."""
+    def window(timely_, method, url):
+        if 60 <= timely_.clock.now < 180:
+            timely_.clock.now += 0.3
+            return FakeResponse(503, "Service Unavailable")
+        return None
+
+    res, _, timely_ = _sweep(monkeypatch, endpoint, window)
+
+    assert not any("run aborted" in e for e in res.errors), res.errors
+    assert res.lookups_failed > 0, "the window fell where the sweep was not looking"
+    assert res.lookups_ok >= fa.MIN_LOOKUP_SUCCESS_RATIO * res.lookups_expected
+
+
+@pytest.mark.parametrize("window_min, retry_after", [(6, None), (16, "60")],
+                         ids=["6-min-fast-503", "16-min-503-retry-after-60"])
+@pytest.mark.parametrize("endpoint", ["/Booking/GetOpenDates?", "/booking/gettimeslots/"])
+def test_a_longer_503_window_on_one_stylist_endpoint_never_stops_the_sweep(
+        monkeypatch, endpoint, window_min, retry_after):
+    """The two windows that still aborted sweeps once the unanswered-request streak had to
+    span two stylists, two sessions and five minutes: fast 503s on gettimeslots for 6 min
+    (8 exhausted requests from 5 sessions), and 503 with Retry-After: 60 for 16 min (3 of
+    them, 12 min apart). A simulated deep sweep was stopped at ~15 and ~22 min, exit 2,
+    nothing written — and without the streak lost 8 and 3 of its 60 lookups and stayed
+    trusted. Such a window costs the lookups it costs; MIN_LOOKUP_SUCCESS_RATIO judges
+    the rest."""
+    headers = {"Retry-After": retry_after} if retry_after else {}
+
+    def window(timely_, method, url):
+        if 60 <= timely_.clock.now < 60 + window_min * 60:
+            timely_.clock.now += 0.3
+            return FakeResponse(503, "Service Unavailable", headers)
+        return None
+
+    res, _, timely_ = _sweep(monkeypatch, endpoint, window)
+
+    assert not any("run aborted" in e for e in res.errors), res.errors
+    assert res.lookups_failed >= 3, "the window fell where the sweep was not looking"
+    assert res.lookups_ok >= fa.MIN_LOOKUP_SUCCESS_RATIO * res.lookups_expected
+    assert res.staff_ok, "the stylists whose lookups all landed keep delete authority"
+
+
+def test_sporadic_fast_503s_that_recover_never_stop_the_sweep(monkeypatch):
+    """The other half: attempts scattered over every endpoint get a fast 503 and recover
+    on their retry. Counted toward the transport cap, ~3.5% of a deep sweep's attempts
+    stopped it at the 50th 503 having lost nothing; they must cost their few seconds of
+    backoff and no lookups. This simulated sweep is far shallower than a deep one, so one
+    attempt in six gets the 503: more of them than the cap, never two in a row."""
+    def sporadic(timely_, method, url):
+        if timely_.misbehaved_requests % 6 == 0:
+            timely_.clock.now += 0.3
+            return FakeResponse(503, "Service Unavailable")
+        return None
+
+    res, _, timely_ = _sweep(monkeypatch, "", sporadic)
+
+    assert timely_.misbehaved_requests // 6 > timely.MAX_TRANSPORT_FAILURES_PER_RUN
+    assert not any("run aborted" in e for e in res.errors), res.errors
+    assert res.lookups_failed == 0
+    assert res.lookups_ok == res.lookups_expected
 
 
 @pytest.mark.parametrize("status", [429, 503])
@@ -749,6 +719,29 @@ def test_a_retried_funnel_post_is_still_checked_for_advancing(slept):
     with pytest.raises(TimelyError, match="did not advance"):
         c.select_staff("175308")
     assert [m for m, _ in session.calls] == ["POST", "POST"]
+
+
+# ------------------------------------------------- a dropped response cache is not read
+def test_a_spot_check_on_a_cached_client_reads_live(slept, tmp_path):
+    """fetch_availability._live_read makes a spot-check a live read by setting
+    `client.cache = None` on a client the sweep built with the response cache. That holds
+    only while TimelyClient._request reads `self.cache`, and fetch's own test drives a fake
+    client, so this pins it on the real one: with both reads already cached, both still
+    reach Timely."""
+    from src.cache import ResponseCache
+    cache = ResponseCache(directory=str(tmp_path), ttl_seconds=900)
+    cache.put("od:svc:175308:2026-7", '{"openDates": ["stale"]}')
+    cache.put("ts:svc:175308:2026-07-22", "stale")
+    session = FakeSession(FakeResponse(200, '{"openDates": []}'),
+                          FakeResponse(200, _read("gettimeslots_empty_2026-07-22.html")))
+    c = TimelyClient(cache=cache, cache_ns="svc")
+    c.session, c.obg = session, OBG
+    assert c.open_dates("175308", 7, 2026) == ["stale"]      # the cache is primed, and read
+    assert session.calls == []
+
+    assert fa._live_read(c, "175308", "2026-07-22") == []
+    (_, od_url), (_, ts_url) = session.calls
+    assert "/Booking/GetOpenDates?" in od_url and "/booking/gettimeslots/?" in ts_url
 
 
 # ------------------------------------------------- the staff POST actually advanced

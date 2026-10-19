@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from conftest import mkconfig
 from src import sync_calendar
 from src.models import MARKER_ID
 # The end-to-end section drives main() on test_main's rig; importing the fixtures is what
@@ -226,7 +227,25 @@ def test_run_summary_for_a_real_run_does_not_claim_a_skip(tmp_path):
                             PUBLISH="true")
     assert proc.returncode == 0, proc.stderr
     assert "Skipped by the freshness gate" not in summary
-    assert "| last successful sync | unknown |" in summary
+
+
+@pytest.mark.parametrize("exit_code, skipped, age, shown", [
+    # The age is measured before the sweep. A run that just synced showed it as the last
+    # successful sync — 13.0 h after a delivery gap, or 'unknown' on a new setup's first
+    # good run — about a calendar it had itself refreshed minutes earlier.
+    ("0", "false", "13.0", "this run (previous: 13.0 h before it started)"),
+    ("0", "false", "", "this run"),
+    # Nothing was refreshed here, so the age is the calendar's real age.
+    ("0", "true", "0.4", "0.4 h before this run"),
+    ("1", "false", "13.0", "13.0 h before this run"),
+    ("2", "false", "", "unknown"),
+    ("", "", "", "unknown"),                           # died before the program started
+])
+def test_run_summary_last_successful_sync(tmp_path, exit_code, skipped, age, shown):
+    proc, _, summary = _run("Run summary", tmp_path, DEPTH="auto", EXIT_CODE=exit_code,
+                            SKIPPED=skipped, LAST_OK_AGE=age, ICS_EVENTS="", PUBLISH="")
+    assert proc.returncode == 0, proc.stderr
+    assert f"| last successful sync | {shown} |" in summary
 
 
 # ------------------------------------------------------------------ failure reporting
@@ -258,11 +277,14 @@ def test_stale_calendar_opens_an_issue(tmp_path, age):
     assert f"last successful sync: {age} h" in calls
 
 
-def test_unknown_age_is_loud(tmp_path):
+@pytest.mark.parametrize("exit_code", ["1", "2", ""])
+def test_unknown_age_is_loud(tmp_path, exit_code):
     """No age means the run died before it could even read the marker — a missing secret,
-    a revoked key, Google down — or the marker records no success at all. Never a passing
-    Timely blip; open the issue."""
-    proc, calls, _ = _report(tmp_path, age="")
+    a revoked key, Google down, or a step before the program started (exit code '') — or
+    the marker records no success at all. That can be a passing checkout or pip blip, and
+    the step opens the issue anyway, on purpose: with no age it cannot tell one from a
+    break that fails every run, and only being loud here keeps that from going unnoticed."""
+    proc, calls, _ = _report(tmp_path, age="", exit_code=exit_code, skipped="")
     assert proc.returncode == 0, proc.stderr
     assert "CALL gh\nissue\ncreate" in calls
     assert "last successful sync: unknown" in calls
@@ -428,6 +450,54 @@ def test_a_persistent_exit_1_opens_an_issue_once_the_calendar_is_12h_stale(
     # calendar and not one issue.
     assert timeline == [("1.0", "warned"), ("7.0", "warned"),
                         ("13.0", "opened"), ("19.0", "commented")]
+
+
+def test_deep_sweeps_that_keep_failing_open_an_issue_once_the_near_runs_stop(
+        rig, monkeypatch, gh_out, tmp_path):
+    """Every deep sweep fails (exit 2: a throttle or request cap that spares the
+    ~240-request near sweeps) and the near sweeps the program puts between them succeed.
+    While it alternated for good, those exits 0 kept the age this step judges at 1-2h:
+    days 22-90 and the .ics feed went stale and no issue ever opened. Now the near runs
+    stop once the last clean deep sweep is 12h old (NEAR_FALLBACK_HOURS), and the streak
+    reaches the 12-hour rule by itself — here 22h after that clean sweep, hourly ticks."""
+    assert sync_calendar.NEAR_FALLBACK_HOURS == 12       # the timeline below assumes it
+    _seed_marker(rig, last_run=NOW - timedelta(hours=7), last_attempt=NOW - timedelta(hours=7),
+                 last_deep_sweep=NOW - timedelta(hours=7))
+    deep_days = mkconfig().lookahead_days
+
+    def on_fetch():
+        deep = rig["config"].lookahead_days == deep_days
+        rig["result"] = _result([], ok=False) if deep else _result(_openings(hour=10))
+    rig["on_fetch"] = on_fetch
+
+    open_issue, timeline = "", []
+    for h in range(18):
+        rig["config"] = mkconfig()     # main() overwrites lookahead_days with its tier
+        code, out = _main(monkeypatch, gh_out, NOW + timedelta(hours=h))
+        if code == 0:
+            timeline.append((h, "synced"))           # a near sweep; Report failure skips
+            continue
+        assert code == 2
+        proc, calls, _ = _run("Report failure", _step_dir(tmp_path, f"run{h}"),
+                              GH_TOKEN="x", JOB_STATUS="failure", RUN_URL="u",
+                              EXIT_CODE=str(code), SKIPPED=out["skipped"],
+                              LAST_OK_AGE=out["last_success_age_hours"],
+                              FAKE_OPEN_ISSUE=open_issue)
+        assert proc.returncode == 0, proc.stderr
+        if "CALL gh\nissue\ncreate" in calls:
+            timeline.append((h, "opened"))
+            open_issue = "41"
+        elif "CALL gh\nissue\ncomment\n41\n" in calls:
+            timeline.append((h, "commented"))
+        else:
+            assert "::warning::Transient failure" in proc.stdout
+            timeline.append((h, "warned"))
+
+    # Alternating while the clean sweep is 7-11h old; deep (and failing) on every run from
+    # 12h. The last success is the near run at h=3, so the age reaches 12h at h=15.
+    assert timeline == ([(0, "warned"), (1, "synced"), (2, "warned"), (3, "synced")]
+                        + [(h, "warned") for h in range(4, 15)]
+                        + [(15, "opened"), (16, "commented"), (17, "commented")])
 
 
 def test_skipped_ticks_behind_a_failing_run_do_not_feed_the_heartbeat(

@@ -244,6 +244,10 @@ jobs:
 
       # Four ticks an hour means most rows in the run list are skips; the summary says so
       # up front, so a skip is never mistaken for a sync that found nothing.
+      #
+      # last_success_age_hours is measured when the run STARTED, so on a run whose sync
+      # exited 0 (and was not a skip) it is the gap before this one, not the age of the
+      # calendar: the last successful sync is this run (same test as Report failure).
       - name: Run summary
         if: always()
         env:
@@ -254,7 +258,9 @@ jobs:
           ICS_EVENTS: ${{ steps.ics.outputs.events }}
           PUBLISH: ${{ steps.ics.outputs.publish }}
         run: |
-          if [ -n "$LAST_OK_AGE" ]; then
+          if [ "${EXIT_CODE:-}" = "0" ] && [ "${SKIPPED:-}" != "true" ]; then
+            last_ok="this run${LAST_OK_AGE:+ (previous: ${LAST_OK_AGE} h before it started)}"
+          elif [ -n "$LAST_OK_AGE" ]; then
             last_ok="${LAST_OK_AGE} h before this run"
           else
             last_ok="unknown"
@@ -361,10 +367,13 @@ jobs:
       #     more without a successful sync (last_success_age_hours, which the program
       #     publishes before it fetches), or when that age is UNKNOWN: the run failed
       #     before it could read the calendar's status marker (missing secret, bad key,
-      #     Google down), or the marker records no successful sync at all (a new setup
-      #     whose runs have all failed, or no marker yet). Either way the cause is setup,
-      #     Google, or a calendar that has never once been refreshed — not a passing
-      #     Timely blip — so be loud;
+      #     Google down — or a step before the program, so a passing checkout or
+      #     pip-install blip too), or the marker records no successful sync at all (a new
+      #     setup whose runs have all failed, or no marker yet). An unknown age can
+      #     therefore be a blip, and it still opens the issue: with no age there is
+      #     nothing to tell it from a break that fails every run the same way (a missing
+      #     secret, a revoked key, a broken lock file), which waiting for a threshold
+      #     would leave silent for good. The next run that syncs closes it;
       #   - a run whose sync step itself exited 0 has just refreshed the calendar, so
       #     whatever failed after it (an artifact upload, say) is not a stale calendar,
       #     whatever the age measured BEFORE the sweep says. It comments on an open issue
@@ -376,6 +385,11 @@ jobs:
       #     only grows. (main() used to stamp it on runs about to exit 1 as well; under
       #     that, a persistent exit 1 read ~6h old on every run and this rule could never
       #     fire. tests/test_workflow.py now runs the program and this step back to back.)
+      #     A streak of failing DEEP sweeps gets there later. The program sweeps near
+      #     after each one, and those near runs succeed, until the last clean deep sweep
+      #     is 12h old (NEAR_FALLBACK_HOURS, src/sync_calendar.py); from then on every
+      #     run goes deep, nothing exits 0, and the age grows. So that issue opens 12-24h
+      #     after the last clean deep sweep, the near window refreshed for the first half.
       # The age is measured when the run STARTED, so a deep sweep that fails 38 min in is
       # judged a little young; the next failure catches up.
       #

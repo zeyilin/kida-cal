@@ -3,12 +3,16 @@
 # Unknown keys are warned about and ignored; invalid values fail the run at startup.
 
 # Deep-sweep window, and the shorter window the runs between deep sweeps use. The program
-# picks between them itself (--depth auto): it goes deep whenever the last deep sweep is
+# picks between them itself (--depth auto): it goes deep once the last deep sweep is
 # older than deep_sweep_every_hours, read off a marker event on the calendar. It does NOT
 # derive the choice from the wall clock — GitHub delivered only 56% of this repo's hourly
 # cron ticks over a measured 180-hour window, and 00:00 UTC never fired once; since late
 # Sep 2026 it has delivered only ~4 runs a day, so runs are often far enough apart that
 # the run after a deep sweep is due another one.
+# One exception: straight after a deep sweep that did not complete (it is not recorded,
+# so deep stays due) the next run sweeps near, so days 0-21 stay fresh, and the one after
+# retries deep. That holds only until the last clean deep sweep is 12h old; from then on
+# every run goes deep until one completes (docs/compliance.md).
 lookahead_days: 90
 near_lookahead_days: 21
 deep_sweep_every_hours: 6

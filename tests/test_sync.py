@@ -828,6 +828,48 @@ def test_a_failed_replacement_keeps_the_old_block_rather_than_going_dark():
     assert len(svc.live()) == 1, "the day must still be represented by SOMETHING"
 
 
+def test_a_rekey_left_standing_is_retired_once_its_replacement_is_unchanged():
+    """A re-key outlives its run when its own delete fails, or when the blast guard refuses
+    the delete pass. Next run its replacement is already on the calendar and needs no
+    write, so it can only count as landed through pass 2's unchanged branch — without
+    that, the old block kept advertising the booked 9:00 on every later run."""
+    cfg = mkconfig(event_style="blocks")
+    (old,) = build_entries(_block_day("nao", 3, [9, 10, 11, 12]), "blocks")
+    after = _block_day("nao", 3, [10, 11, 12])
+    (new,) = build_entries(after, "blocks")
+    svc = FakeCalendarService(
+        events=[_existing_entry(old, cfg)],
+        fail_plan={("delete", old.google_event_id()): [
+            http_error(500, "Server Error", "backendError")]})
+
+    first = sync_calendar.sync(cfg, _result(after, staff_ok={"nao"}), service=svc)
+    assert (first["insert"], first["failed_delete"]) == (1, 1)
+    assert set(svc.live()) == {old.google_event_id(), new.google_event_id()}
+
+    second = sync_calendar.sync(cfg, _result(after, staff_ok={"nao"}), service=svc)
+
+    assert (second["unchanged"], second["delete"], second["skipped_delete"]) == (1, 1, 0)
+    assert set(svc.live()) == {new.google_event_id()}
+
+
+def test_a_rekey_whose_replacement_is_revived_from_a_tombstone_is_retired():
+    """The booked-then-cancelled-then-booked-again lifecycle: the 10-12 block was live
+    once, was deleted when the 9:00 freed up, and is wanted again now the 9:00 is taken.
+    Its id is a tombstone, so it lands through the 409 revive — and that must count as
+    landed, or the old 9-12 block is kept whole on every run."""
+    cfg = mkconfig(event_style="blocks")
+    (old,) = build_entries(_block_day("nao", 3, [9, 10, 11, 12]), "blocks")
+    after = _block_day("nao", 3, [10, 11, 12])
+    (new,) = build_entries(after, "blocks")
+    svc = FakeCalendarService(events=[_existing_entry(old, cfg),
+                                      dict(_existing_entry(new, cfg), status="cancelled")])
+
+    stats = sync_calendar.sync(cfg, _result(after, staff_ok={"nao"}), service=svc)
+
+    assert (stats["revive"], stats["delete"], stats["skipped_delete"]) == (1, 1, 0)
+    assert set(svc.live()) == {new.google_event_id()}
+
+
 def test_a_genuine_booking_is_still_deleted_first():
     """The re-key deferral must not blunt the urgent case: a stylist-day that has left the
     feed entirely is an advertised appointment that is already taken."""
@@ -1798,6 +1840,26 @@ def test_a_deep_sweep_that_completed_is_not_read_as_a_failed_one():
     m = _depth_marker(last_attempt=started, last_deep_attempt=started,
                       last_deep_sweep=started + timedelta(minutes=38))
     assert sync_calendar.resolve_depth(cfg, "auto", m, now=T0) == (cfg.lookahead_days, True)
+
+
+@pytest.mark.parametrize("clean_ago, deep", [
+    (timedelta(hours=sync_calendar.NEAR_FALLBACK_HOURS) - timedelta(minutes=1), False),
+    (timedelta(hours=sync_calendar.NEAR_FALLBACK_HOURS), True),
+    (None, True),                     # no clean deep sweep recorded at all
+])
+def test_a_failed_deep_sweep_hands_runs_to_near_only_up_to_the_fallback_limit(clean_ago, deep):
+    """Alternating for good let a deep sweep fail on every attempt with no alert: the near
+    runs in between exit 0, so last_success_age_hours never aged toward the workflow's
+    12-hour issue rule while days 22-90 and the .ics feed went stale. Past the limit every
+    auto run is deep again, and a deep sweep that keeps failing stops the runs succeeding."""
+    cfg = mkconfig()
+    started = T0 - timedelta(hours=1)
+    stamps = {"last_attempt": started, "last_deep_attempt": started}
+    if clean_ago is not None:
+        stamps["last_deep_sweep"] = T0 - clean_ago
+    days, got = sync_calendar.resolve_depth(cfg, "auto", _depth_marker(**stamps), now=T0)
+    assert (days, got) == ((cfg.lookahead_days, True) if deep
+                           else (cfg.near_lookahead_days, False))
 
 
 def test_an_explicit_full_is_deep_even_right_after_a_failed_one():

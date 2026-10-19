@@ -45,9 +45,13 @@ for three days without a single alert.
 
 When the sync keeps failing, it opens a GitHub issue — but only once the calendar has gone
 12 hours or more without a successful refresh, or when it can't tell how long that's been
-(a missing secret, say, or a new setup that has never synced cleanly). A one-off failure
-just leaves a warning on that run, and the issue closes itself after the next successful
-sync. To retry a failed run straight away, use **Re-run all jobs** on it: a re-run always
+(a missing secret, say, a new setup that has never synced cleanly, or a run that broke
+before it could look — which can be a one-off). Any other one-off failure just leaves a
+warning on that run, and the issue closes itself after the next successful sync. If only
+the full 90-day checks are failing, the quick ones go on succeeding for up to 12 more
+hours first, so that issue can take up to a day to open.
+
+To retry a failed run straight away, use **Re-run all jobs** on it: a re-run always
 checks, even within the 50 minutes.
 
 ### Getting a reliable hourly refresh

@@ -2,7 +2,8 @@
 
 _Recorded during Phase 0 recon on 2026-07-17. Usage profile re-measured 2026-07-25; run
 cadence and the freshness gate described 2026-10-12; stop conditions brought in line with
-`src/timely.py` 2026-10-19._
+`src/timely.py` 2026-10-19; volume table updated from the October 2026 production runs
+2026-10-24._
 
 ## robots.txt
 
@@ -47,31 +48,37 @@ Disallow: /cdn-cgi/
 
 The earlier "low hundreds of requests per run" figure described a haircut-only feed.
 The deployed config is all services × all stylists × 90 days, so it was wrong by an
-order of magnitude. Measured on a real deep sweep, and after the de-duplication
-described in `src/fetch_availability.py`:
+order of magnitude. Measured, not estimated: the first row on a real deep sweep before
+the de-duplication described in `src/fetch_availability.py`, the other two from the
+October 2026 production runs (near-term sync steps took 9m50s–11m08s):
 
 | | requests / deep run | wall clock |
 | --- | --- | --- |
 | before de-duplication | ~5,050 | ~84 min |
-| after | ~2,400 | ~39 min |
-| near-term (21-day) run | ~410 | ~7 min |
+| after | ~1,700 | ~40 min |
+| near-term (21-day) run | ~385 | ~10 min |
 
-Re-measured 2026-08-09, after the 3-second POST pacing landed: a deep sweep made **1,575
-requests in 37m50s** and a near-term run **240 requests in 6m59s**. Request counts scale
-with how much availability actually exists, so they drift below the figures above on a
-busy week; the wall clock is the stable number. Every run prints its own `requests_made`,
-so this table can be checked rather than trusted. Deep sweeps run about every 6 hours
+Earlier measurements ran lower: on 2026-08-09, after the 3-second POST pacing landed, a
+deep sweep made 1,575 requests in 37m50s and a near-term run 240 requests in 6m59s.
+Request counts scale with how much availability actually exists, so they drift from week
+to week, and a near-term run's wall clock moves with them — it went from ~7 to ~10
+minutes as its request count rose. Every run prints its own `requests_made`, so this
+table can be checked rather than trusted. Deep sweeps run about every 6 hours
 (`deep_sweep_every_hours`), not on every run — but that is a target, not a ceiling. A deep
-sweep that does not complete cleanly (an untrusted fetch, more lost calendar writes than
-the run's exit floor allows, a refused delete pass) fails the run and is not recorded as
-one, so it stays due; a few lost writes under that floor are left to the next scheduled
-deep sweep. The next run that gets past the gate sweeps near instead, so that days 0–21
-stay fresh, and the one after it retries deep: while such a condition lasts, every other
-run can be a ~38-minute deep sweep. That only holds until the last clean deep sweep is 12
-hours old (`NEAR_FALLBACK_HOURS` in `src/sync_calendar.py`); from then on every run is a
-deep sweep until one completes. That is deliberate: the near runs in between succeed, so
-alternating indefinitely would keep a deep sweep that never completes from ever reaching
-the workflow's 12-hour failure-issue rule. A manual `full` dispatch is always deep.
+sweep that fails the run for any reason (an untrusted fetch, more lost calendar writes or
+more withheld deletes than the run's exit floors allow, a refused delete pass) is not
+recorded as one, so it stays due. A few lost writes under that floor are left to the next
+scheduled deep sweep: the days 22–90 openings they carried stay off Google Calendar, and
+a far block they were replacing stays up, until then — up to about 10 hours at the
+current cadence — though the `.ics` feed that sweep published already has them. After a
+deep sweep that is not recorded, the next run that gets past the gate sweeps near
+instead, so that days 0–21 stay fresh, and the one after it retries deep: while such a
+condition lasts, every other run can be a ~40-minute deep sweep. That only holds until the
+last clean deep sweep is 12 hours old (`NEAR_FALLBACK_HOURS` in `src/sync_calendar.py`);
+from then on every run is a deep sweep until one completes. That is deliberate: the near
+runs in between succeed, so alternating indefinitely would keep a deep sweep that never
+completes from ever reaching the workflow's 12-hour failure-issue rule. A manual `full`
+dispatch is always deep.
 
 ### How often we look: the freshness gate
 
@@ -141,10 +148,11 @@ These are enforced in code, not just documented — see `src/timely.py`:
 
 - `MAX_CONSECUTIVE_THROTTLES` (3): three consecutive *fully-retried* requests to the same
   endpoint — each having already spent all 5 attempts, so ~15 actual 429 responses — raise
-  `BudgetExhausted` and end the run. The next scheduled run retries — no sooner than 50
-  minutes after this one started, because a throttled run still counts toward the
-  freshness gate above (once the calendar has a status marker; see the exceptions there)
-  — so we do not grind.
+  `BudgetExhausted`, which stops every further Timely request this run (what that does to
+  the run's result is under `BudgetExhausted` below). The next scheduled run retries — no
+  sooner than 50 minutes after this one started, because a throttled run still counts
+  toward the freshness gate above (once the calendar has a status marker; see the
+  exceptions there) — so we do not grind.
 
   Counted per `(method, path)`, which matters more than it looks. Timely throttles one
   funnel step at a time while its neighbours stay healthy, and every step we make has a
@@ -187,6 +195,15 @@ These are enforced in code, not just documented — see `src/timely.py`:
   level and returns a result explicitly marked untrusted — `ok=False`, and delete authority
   over nobody — so the run still writes its fetch artifact and exits 2 ("nothing was written
   to the calendar") instead of dying with a traceback on what is an expected outcome.
+
+  The one exception is a stop condition that trips once every lookup has already landed:
+  during the de-duplication spot-checks made after the sweep, or on the last planned
+  service's own spot-check. It still stops every further Timely request, but it voids
+  nothing, because the data is already complete: the result stays `ok=True`, its errors
+  record `dedup spot-checks stopped …`, and the run writes to the calendar as usual (exit 0
+  unless something else fails). A throttle on the re-ask that a spot-check mismatch
+  triggers is not covered by that exception: the mismatch it was checking stands, so that
+  fetch is untrusted and exits 2.
 
 The User-Agent is `kida-cal/0.2 (+personal read-only availability mirror; contact via
 repo issues)`. It previously carried a `Mozilla/5.0 (Macintosh; ...)` prefix, which

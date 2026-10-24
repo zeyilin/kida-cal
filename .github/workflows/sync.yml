@@ -81,8 +81,9 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # Observed deep (90-day) sweeps take ~38 min; near-term sweeps ~7 min (2026-08-09:
-    # 37m50s / 1,575 requests and 6m59s / 240 requests). The 82-85 min this comment used to
+    # Observed deep (90-day) sweeps take ~40 min / ~1,700 requests and near-term sweeps
+    # ~10 min / ~385 requests (October 2026 production runs; docs/compliance.md has the
+    # table, and the lower 2026-08-09 measurement). The 82-85 min this comment used to
     # quote was the pre-de-duplication figure and had been stale since that landed. The
     # generous 120 stays: it is headroom for a slow Timely day, and the throttle stop
     # conditions — not this timeout — are what end a run we are being rate-limited out of.
@@ -163,7 +164,7 @@ jobs:
       - name: Sync calendar
         id: sync
         env:
-          # 7-38 minutes of silence otherwise, with the progress line buffered until it
+          # 10-40 minutes of silence otherwise, with the progress line buffered until it
           # lands mid-traceback.
           PYTHONUNBUFFERED: "1"
           KIDA_SERVICE_ACCOUNT_JSON: ${{ runner.temp }}/sa-key.json
@@ -197,7 +198,7 @@ jobs:
           exit "$code"
 
       # Keep the fetch even when the write side blows up, so debugging a 409 or a bad
-      # dedupe doesn't cost another 38-minute deep sweep. Not on a skipped run: it fetched
+      # dedupe doesn't cost another ~40-minute deep sweep. Not on a skipped run: it fetched
       # nothing, so there is no file, and if-no-files-found would put a warning on every
       # surplus tick.
       - name: Upload fetch result
@@ -390,7 +391,7 @@ jobs:
       #     is 12h old (NEAR_FALLBACK_HOURS, src/sync_calendar.py); from then on every
       #     run goes deep, nothing exits 0, and the age grows. So that issue opens 12-24h
       #     after the last clean deep sweep, the near window refreshed for the first half.
-      # The age is measured when the run STARTED, so a deep sweep that fails 38 min in is
+      # The age is measured when the run STARTED, so a deep sweep that fails ~40 min in is
       # judged a little young; the next failure catches up.
       #
       # cancelled() is included because a run cancelled mid-flight (by hand, or by hitting

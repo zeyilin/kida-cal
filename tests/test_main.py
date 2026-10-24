@@ -814,3 +814,41 @@ def test_a_stylist_whose_blocks_keep_shrinking_unseen_fails_the_run(rig, monkeyp
     touched = {e for m, e in rig["service"].calls if m in ("patch", "delete", "update")}
     assert touched.isdisjoint(held)
     assert all(rig["service"].live()[i]["summary"] == "Nao · 5 open" for i in held)
+
+
+def test_a_deep_sweep_that_fails_only_on_withheld_deletes_is_not_recorded(
+        rig, monkeypatch, gh_out):
+    """A stylist uncovered on every run, over SKIPPED_DELETE_EXIT_FLOOR only in days 22-90:
+    every deep run exits 1, every near run exits 0. The deep runs were still recorded as
+    clean deep sweeps, so the next one was near and exited 0, the age of the last success
+    swung between 5 and 10 hours and never reached the workflow's 12-hour issue rule, and
+    the .ics feed (only a deep run that exits 0 gets it published) froze with nothing
+    raised. A deep sweep is now recorded exactly when the run exits 0, so the deep stays
+    due, every run goes deep once the last clean one is NEAR_FALLBACK_HOURS old, and the
+    age crosses the threshold."""
+    assert sync_calendar.NEAR_FALLBACK_HOURS == 12       # the schedule below assumes it
+    cfg = mkconfig()
+    for d in range(30, 30 + sync_calendar.SKIPPED_DELETE_EXIT_FLOOR + 5):
+        for ev in _openings(n=1, stylist="sick", days_ahead=d, hour=10):
+            (entry,) = sync_calendar.build_entries([ev], cfg.event_style)
+            body = sync_calendar.entry_body(entry, cfg, "")
+            rig["service"].store[body["id"]] = dict(body, status="confirmed")
+    rig["result"] = _result(_openings(stylist="175308", hour=10), staff_ok={"175308"})
+    rig["result"].staff_planned = {"175308", "sick"}
+    clean_at = NOW - timedelta(hours=7)
+    _seed_marker(rig, last_attempt=NOW - timedelta(hours=2), last_run=NOW - timedelta(hours=2),
+                 last_deep_sweep=clean_at)
+    deep_days = mkconfig().lookahead_days
+    depths, codes, ages = [], [], []
+    rig["on_fetch"] = lambda: depths.append(rig["config"].lookahead_days == deep_days)
+
+    for h in range(16):
+        gh_out.write_text("")
+        codes.append(_tick(rig, monkeypatch, NOW + timedelta(hours=h)))
+        ages.append(float(_outputs(gh_out)["last_success_age_hours"]))
+
+    private = rig["service"].live()[MARKER_ID]["extendedProperties"]["private"]
+    assert private["last_deep_sweep"] == clean_at.isoformat()
+    assert depths == [True, False, True, False, True] + [True] * 11
+    assert codes == [1 if deep else 0 for deep in depths]
+    assert ages[-1] >= 12                                # STALE_ALERT_HOURS in sync.yml

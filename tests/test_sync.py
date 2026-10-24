@@ -605,13 +605,14 @@ def test_changeover_purge_does_not_count_replacements_it_withheld():
     legacy = _legacy_calendar([_event(stylist_id=f"s{i}", stylist=f"S{i}",
                                       days_ahead=3, hour=9 + h)
                                for i in range(10) for h in range(6)])
-    # A stylist we could not see completely, holding a stale CURRENT-style entry (so the
-    # withhold rule fires) and 30 openings this run (so the pop is worth 30 openings).
+    # A stylist we could not see completely, holding a stale CURRENT-style entry on each
+    # day they have openings this run (so the withhold rule holds those days) and 30
+    # openings this run (so the pop is worth 30 openings).
     sick = [_event(stylist_id="sick", stylist="Sick", days_ahead=4 + d, hour=9 + h)
             for d in range(5) for h in range(6)]
-    sick_stale = _existing_from(_event(stylist_id="sick", stylist="Sick",
-                                       days_ahead=12, hour=9), cfg)
-    svc = FakeCalendarService(events=legacy + [sick_stale])
+    sick_stale = [_existing_from(_event(stylist_id="sick", stylist="Sick",
+                                        days_ahead=4 + d, hour=17), cfg) for d in range(5)]
+    svc = FakeCalendarService(events=legacy + sick_stale)
 
     stats = sync_calendar.sync(
         cfg, _result(covered + sick, staff_ok={f"s{i}" for i in range(10)}), service=svc)
@@ -1196,19 +1197,51 @@ def test_a_half_seen_stylist_is_not_patched_down_to_partial_data(clock):
     assert "4 open" in svc.live()[block]["summary"]
 
 
-def test_a_half_seen_stylist_gets_no_new_entries_either(clock):
-    """Rule 1 covers inserts too: whatever the partial view shows of them is not published
-    until we can see them completely."""
+def test_a_half_seen_stylists_day_with_anything_to_retire_or_rewrite_gets_no_write(
+        clock, capsys):
+    """Rule 1 covers inserts too, a day at a time: a day of theirs holding anything this
+    run would delete, shrink or rewrite gets no write at all — even one that overlaps none
+    of it, since the partial view of that day is exactly what we cannot trust."""
+    clock(T0)
+    cfg = mkconfig(event_style="blocks")
+    held = [_at(3, 9, "sick")]                               # gone from the feed: held
+    growing = [_at(5, h, "sick") for h in (9, 10)]           # would grow: still a rewrite
+    svc, (held_id, growing_id) = _cal(cfg, held, growing)
+    fresh = [_at(4, 9, "sick")]                              # a day with nothing held
+    feed = ([_at(3, 15, "sick")]                             # the held entry's day
+            + [_at(5, h, "sick") for h in (9, 10, 11)] + [_at(5, 16, "sick")] + fresh)
+
+    stats = sync_calendar.sync(cfg, _res(feed, staff_ok={"nao"},
+                                         staff_planned={"nao", "sick"}, lookups_failed=1),
+                               service=svc)
+
+    assert svc.methods("insert") == [_block_id(fresh)]
+    assert svc.methods("patch") == [] and svc.methods("delete") == []
+    assert held_id in svc.live()
+    assert svc.live()[growing_id]["summary"] == "Sick · 2 open"
+    assert stats["skipped_delete"] == 1
+    assert ("leaving 2 day(s) of theirs as they are: withholding 1 delete(s) and 3 "
+            "write(s)") in capsys.readouterr().out
+
+
+def test_a_half_seen_stylists_day_with_nothing_held_is_published(clock):
+    """...and only a day at a time. Withholding the stylist's whole window kept every
+    reopened slot, and on a deep sweep the whole day that had just entered the window, off
+    the calendar for as long as one of their lookups kept failing (Timely 429s the same
+    /Booking/Service POSTs run after run), though nothing of theirs was on that day for it
+    to overlap. What the partial view found there is published: at worst it under-lists
+    the failed service until a complete run grows it."""
     clock(T0)
     cfg = mkconfig(event_style="blocks")
     svc = FakeCalendarService()
 
     stats = sync_calendar.sync(
         cfg, _res([_at(3, 9, "sick"), _at(4, 9)], staff_ok={"nao"},
-                  staff_planned={"nao", "sick"}), service=svc)
+                  staff_planned={"nao", "sick"}, lookups_failed=1), service=svc)
 
-    assert svc.methods("insert") == [_block_id([_at(4, 9)])]
-    assert stats["insert"] == 1
+    assert sorted(svc.methods("insert")) == sorted([_block_id([_at(3, 9, "sick")]),
+                                                    _block_id([_at(4, 9)])])
+    assert stats["insert"] == 2 and stats["skipped_delete"] == 0
 
 
 def test_a_stylist_who_was_never_looked_for_is_deleted_not_held(clock):
@@ -1228,6 +1261,27 @@ def test_a_stylist_who_was_never_looked_for_is_deleted_not_held(clock):
     assert stats["delete"] == 3
     assert stats["skipped_delete"] == 0
     assert set(svc.live()) == {ids[-1]}
+
+
+def test_a_stylist_left_out_of_the_plan_is_named_as_their_entries_go(clock, capsys):
+    """...and the run says whose. Deleting them is right for someone who left or is hidden
+    from online booking, and looks exactly the same as a service catalog that parsed with a
+    whole category missing (Hair Salon is the only home of three stylists): a third of the
+    calendar gone at exit 0, with nothing in the log beyond a delete count."""
+    clock(T0)
+    cfg = mkconfig(event_style="blocks")
+    hiroki = "686999"
+    svc, ids = _cal(cfg, *[[_at(2 + i, 10, hiroki)] for i in range(3)], [_at(-1, 10, hiroki)],
+                    [_at(2, 14)])
+    feed = _res([_at(2, 14)], staff_ok={"nao"}, staff_planned={"nao"})
+
+    stats = sync_calendar.sync(cfg, feed, service=svc)
+
+    assert stats["delete"] == 4 and set(svc.live()) == {ids[-1]}
+    assert ("1 stylist(s) with current entries were not in this run's plan (Hiroki: 3 "
+            "entr(ies), 3 opening(s))") in capsys.readouterr().out
+    sync_calendar.sync(cfg, feed, service=svc)          # nothing of theirs left to name
+    assert "not in this run's plan" not in capsys.readouterr().out
 
 
 def test_without_a_recorded_plan_absence_from_staff_ok_still_holds(clock):
@@ -1412,6 +1466,27 @@ def test_live_openings_does_not_double_count_a_blocked_run(clock):
     assert stats["live_openings"] == 40 * 5              # ...advertising 200 openings
 
 
+def test_a_refused_delete_pass_shrinks_no_block_either(clock):
+    """The guard refused the deletes but not the patches, so a feed showing only part of
+    the salon's days still patched every block that kept its id down to the part it saw
+    — the loss the refusal was there to stop, landed through the patch path. Retiring part
+    of a block is a delete of that part, refused with the rest."""
+    clock(T0)
+    cfg = mkconfig(event_style="blocks")
+    days = [[_at(1 + (i % 18), h, f"s{i}") for h in range(9, 14)] for i in range(40)]
+    svc, ids = _cal(cfg, *days)
+    lost_tail = days[0][:3]                              # 12:00 and 13:00 gone: pass 2
+    head, tail = days[1][:2], days[1][3:]                # 11:00 gone: a narrowing patch
+    # 21 of the 40 entries gone entirely: over half, so the delete pass is refused.
+    feed = lost_tail + head + tail + [o for d in days[2:19] for o in d]
+
+    stats = sync_calendar.sync(cfg, _res(feed), service=svc)
+
+    assert stats["delete"] == 0 and svc.methods("patch") == []
+    assert all(svc.live()[i]["summary"].endswith("· 5 open") for i in ids)
+    assert stats["blocked_delete"] == 21 + 2
+
+
 # ------------------------------------------- a split block: the head shrinks, the tail is new
 # A block keeps its id while its first opening stands, so a booking in the MIDDLE of one
 # does not re-key it: the head is patched smaller under the old id and the tail is a new
@@ -1471,6 +1546,26 @@ def test_a_split_blocks_head_is_shrunk_once_its_tail_is_live(clock):
     assert writes == [("insert", _block_id(tail)), ("patch", block)]
     assert "2 open" in svc.live()[block]["summary"]
     assert stats["skipped_delete"] == 0 and stats["live_openings"] == 4
+
+
+def test_an_abort_after_a_split_blocks_tail_landed_does_not_publish_its_day_twice(clock):
+    """The head's narrowing patch waited behind EVERY insert, so a quota 403 on a later,
+    unrelated insert left the tail live beside a head still stored wide: one stylist-day
+    published twice, the booked 11:00 still advertised, until the next run reached it. The
+    head is narrowed the moment its tail lands."""
+    clock(T0)
+    cfg = mkconfig(event_style="blocks")
+    svc, block, head, tail = _split(cfg)
+    later = [_at(4, 9, "sachi")]                         # inserted after the tail
+    svc.fail_plan[("insert", _block_id(later))] = [
+        http_error(403, "Quota Exceeded", "quotaExceeded")]
+
+    with pytest.raises(sync_calendar.WriteAborted):
+        sync_calendar.sync(cfg, _res(head + tail + later, staff_ok={"nao", "sachi"},
+                                     staff_planned={"nao", "sachi"}), service=svc)
+
+    assert set(svc.live()) == {block, _block_id(tail)}
+    assert svc.live()[block]["summary"] == "Nao · 2 open"
 
 
 def test_a_block_that_only_lost_its_last_openings_is_patched_before_the_inserts(clock):
@@ -1667,6 +1762,25 @@ def test_a_marker_written_after_a_failed_run_keeps_the_last_success():
     assert "last_run" not in svc.live()[MARKER_ID]["extendedProperties"]["private"]
 
 
+@pytest.mark.parametrize("stored, shown", [
+    ("2026-10-02T21:00:00-04:00", "2026-10-02 9:00 PM EDT"),
+    ("2026-03-02T21:00:00-05:00", "2026-03-02 9:00 PM EST"),
+    ("2026-10-02T21:00:00", "2026-10-02 9:00 PM EDT"),         # a hand-edited, naive stamp
+])
+def test_a_failed_runs_marker_shows_the_last_clean_sync_in_salon_time(stored, shown):
+    """last_run is read back off the marker with a fixed offset, which %Z printed as
+    'UTC-04:00' on the public status entry, right under a line saying 'EDT'."""
+    svc = FakeCalendarService()
+    sync_calendar.write_marker(svc, "cal", checked_at=datetime(2026, 10, 3, 2, 0, tzinfo=NY),
+                               entry_count=3, last_deep=None, succeeded=False,
+                               previous_success=datetime.fromisoformat(stored))
+
+    marker = svc.live()[MARKER_ID]
+    assert f"the last clean sync was at {shown}." in marker["description"]
+    assert "UTC-" not in marker["description"]
+    assert marker["extendedProperties"]["private"]["last_run"] == stored
+
+
 def test_a_deleted_marker_reads_as_no_marker():
     """events.get returns a soft-deleted event rather than 404. A marker someone deleted
     to reset the state must not keep vouching for a recent deep sweep or run start."""
@@ -1692,9 +1806,9 @@ def test_one_stylists_failed_lookup_does_not_freeze_everyone_elses_descriptions(
     moved from Nao's 10:00 to her 11:00 — same ids, same spans, same titles, so only the
     descriptions changed — and because Sachi had a failed lookup, Nao's calendar kept
     offering a 10:00 Beard Trim that was no longer bookable and never offered the 11:00
-    one that was, on every run where anything anywhere failed. Every stylist with a failed
-    lookup is already withheld whole (rule 1), so whatever is still compared belongs to
-    someone every one of whose lookups landed."""
+    one that was, on every run where anything anywhere failed. No existing entry of a
+    stylist with a failed lookup is ever rewritten (rule 1), so whatever is still compared
+    belongs to someone every one of whose lookups landed."""
     clock(T0)
     cfg = mkconfig(event_style=style)
     before = [_offering(_at(3, 10), "Hair Cut", "Beard Trim"), _offering(_at(3, 11), "Hair Cut")]
@@ -1713,7 +1827,9 @@ def test_one_stylists_failed_lookup_does_not_freeze_everyone_elses_descriptions(
     for eid, body in want.items():
         assert svc.live()[eid]["description"] == body["description"]
     assert stats["patch"] == len(want)
-    assert svc.methods("insert") == []                          # Sachi is still withheld
+    # Sachi's one new entry is on a day holding nothing of hers, so it is published.
+    assert svc.methods("insert") == [build_entries([_at(4, 9, "sachi")],
+                                                   style)[0].google_event_id()]
 
 
 def test_a_narrowing_that_waits_on_a_later_narrowing_lands_on_a_clean_run(clock, capsys):

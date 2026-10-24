@@ -105,7 +105,7 @@ MAX_THROTTLED_REQUESTS_PER_RUN = 5
 # backoff, pacing) whether or not its request then recovers, so this bounds the hung
 # endpoint above (its 50th failed attempt is its 10th request) and a network losing 5% of
 # requests at random, which fails almost no request outright yet still pushed a simulated
-# deep sweep to ~126 min. 50 of them add under 45 min to the observed ~38-min deep sweep —
+# deep sweep to ~126 min. 50 of them add under 45 min to the observed ~40-min deep sweep —
 # inside the 120-min job timeout — and are ~12x the 4 timeouts that cost the 2026-09-05
 # run its lookups, so ordinary flakiness still recovers rather than aborting.
 #
@@ -127,7 +127,7 @@ MAX_TRANSPORT_FAILURES_PER_RUN = 50
 # may ask us to wait, a 429 that recovers on a late attempt reaches no throttle total, and
 # a 5xx counts toward none of them. Four 429s or 503s with Retry-After: 120 and then a 200
 # cost 8 min — counting toward nothing else at all — and on every gettimeslots call they
-# ran a simulated sweep for ~8 hours. 40 min on top of the observed ~38-min deep sweep
+# ran a simulated sweep for ~8 hours. 40 min on top of the observed ~40-min deep sweep
 # keeps the worst case near 80 min, inside the 120-min job timeout with room for setup and
 # the calendar sync — and a healthy run's occasional 429 costs seconds of it, so only a
 # host that keeps asking for long waits, or keeps failing slowly, ever trips it.
@@ -153,6 +153,17 @@ class TimelyError(RuntimeError):
     """Raised when the funnel shape is not what recon documented (fail loudly)."""
 
 
+class RetriesExhausted(TimelyError):
+    """One request used up every retry — 429s, 5xx or transport errors, never an answer.
+
+    Inside the sweep it fails its one lookup like any other TimelyError. It is a separate
+    class for the one place that must tell it apart from a shape change: the catalog
+    bootstrap, where a request that never got an answer is a bad moment on Timely's side
+    (exit 2 and retry next run), while a page that answered but lacks the obg or the
+    catalog is a shape change and must stay a loud crash.
+    """
+
+
 class BudgetExhausted(TimelyError):
     """The per-run request cap, a throttle stop condition, the run-wide transport-failure
     cap, or the run-wide retry-time budget tripped.
@@ -163,6 +174,13 @@ class BudgetExhausted(TimelyError):
     explicitly marked untrusted (ok=False, delete authority over nobody) — which keeps every
     downstream guard working and the fetch artifact written, rather than killing the process
     with a traceback on what is now an expected outcome of a throttle window.
+
+    The one exception is a stop condition that trips after every lookup has landed: during
+    the post-sweep dedup spot-checks, or on the last planned service's own check. Those
+    checks only re-read days already fetched, so the checks stop but the stop alone does not
+    mark the result untrusted ("dedup spot-checks stopped ..." goes in its errors), and the
+    run writes as usual. A
+    throttle on a mismatch's re-ask (_source_agrees) still leaves the fetch untrusted.
     """
 
 
@@ -505,7 +523,7 @@ class TimelyClient:
                 BUDGET.retry_cost(method, url, failure,
                                   spent=time.monotonic() - started, wait=wait)
                 if last:
-                    raise TimelyError(
+                    raise RetriesExhausted(
                         f"{method} {url} failed after 5 attempts: {failure}") from e
                 time.sleep(wait)
                 backoff *= 2
@@ -551,7 +569,7 @@ class TimelyClient:
                 BUDGET.retry_cost(method, url, failure,
                                   spent=time.monotonic() - started, wait=wait)
                 if last:
-                    raise TimelyError(f"{resp.status_code} from {url} after retries")
+                    raise RetriesExhausted(f"{resp.status_code} from {url} after retries")
                 time.sleep(wait)
                 backoff *= 2
                 continue

@@ -15,7 +15,8 @@ identity. Only ~27 distinct (staff, duration) combinations exist, so most of tho
 re-fetch bytes we already have. We learn each pair's duration by decoding the first
 response's booking token (never from a hardcoded table, which would silently drift and
 attribute slots to the wrong service) and memoize by (staff, duration, date) from then on.
-Measured effect on a 90-day sweep: ~5,050 requests / 84 min → ~2,300 / ~39 min.
+Measured effect on a 90-day sweep: ~5,050 requests / 84 min → ~2,300 / ~39 min when it
+landed; ~1,700 / ~40 min in the October 2026 production runs (docs/compliance.md).
 
 `verify_dedup_samples` caps how many memo hits per run are re-fetched live and compared,
 so if that invariant ever stops holding we hear about it instead of publishing wrong times.
@@ -330,7 +331,9 @@ class _DedupSampler:
     ahead of time and lost every one it promised to such a pair: with the default 4 checks,
     `stylists: [Nao]` left one of its 3 memo-served services unchecked on most runs. Now:
 
-    * at most `budget` live re-fetches per run, the same politeness bound as before;
+    * at most `budget` live re-fetches per run. A check paid after the sweep also costs a
+      new session's setup requests, two of them funnel POSTs (see _make_up_checks for the
+      total), and a mismatch one more session before it voids the run (_source_agrees);
     * the checked SERVICES are the first `budget` memo-served services in a random priority
       order drawn once per run — so a uniformly random set of that many, and every one of
       them whenever the budget covers them all. A service's place in the plan, and how many
@@ -467,7 +470,7 @@ def _source_agrees(source: dict, svc: dict, staff_id: str, day: str, live: list,
                    make_client, service_staff_ids: dict, errors: list[str]) -> bool:
     """A check made after the sweep disagreed with the memo. That is not proof the
     invariant broke: the memo holds what `source` read live, up to the whole sweep earlier
-    (~39 minutes for a deep one), and a booking or a cancellation since then changes that
+    (~40 minutes for a deep one), and a booking or a cancellation since then changes that
     stylist's day for every service alike. So `source` is asked again, now, in a new
     session. If it gives the same day as the check, the two services agree and only the day
     changed: the pair is left unverified, like one the draw passed over, and True is
@@ -502,10 +505,19 @@ def _check_not_made(svc: dict, staff_id: str, day: str, e: Exception) -> str:
     return msg
 
 
-def _checks_stopped(e: BudgetExhausted, when: str) -> str:
+def _checks_stopped(e: Exception, when: str) -> str:
     msg = f"dedup spot-checks stopped {when}: {e}"
     print(f"::warning::{msg}", file=sys.stderr)
     return msg
+
+
+def _throttling() -> bool:
+    """Whether Timely is throttling an endpoint right now: its latest request spent all its
+    retries on 429s and no request to it has succeeded since (the per-endpoint streak in
+    src/timely.py). Short of a stop condition such a request raises a plain TimelyError,
+    which on its own does not say it was a throttle. Every make-up session sends every
+    endpoint the sweep does, so it would be sent straight back into that throttle."""
+    return any(timely.BUDGET.throttles.values())
 
 
 def _make_up_checks(plan, sampler: _DedupSampler, make_client,
@@ -520,7 +532,7 @@ def _make_up_checks(plan, sampler: _DedupSampler, make_client,
     sweep's requests in the sweep's order: the funnel, then GetOpenDates for the stylist,
     then gettimeslots (see _live_read). The price is a session's three setup requests (two
     of them the funnel POSTs) per service checked here, and one GetOpenDates per check: at
-    most 16 with the default 4 checks, against a ~2,300-request sweep. Simulated against the
+    most 16 with the default 4 checks, against a ~1,700-request sweep. Simulated against the
     real menu (docs/timely-api.md), about half of all runs need one such session and a few
     need two. A mismatch costs one more session and two reads, to ask the service the memo
     came from before it voids the run (see _source_agrees).
@@ -530,7 +542,10 @@ def _make_up_checks(plan, sampler: _DedupSampler, make_client,
     throttle (BudgetExhausted) stops the checks — it means stop sending — but does not
     abort the run: it says nothing about data that is already complete. (The last planned
     service's own check, made inside the sweep but with nothing left to walk, is treated
-    the same way; see fetch().)
+    the same way; see fetch().) So does a check that fails on one request throttled short
+    of a stop condition (see _throttling): the next service's session would send the same
+    request into the same throttle, five 429s and their Retry-After waits apiece, on a run
+    whose every lookup has already landed.
     """
     sessions: dict[int, object] = {}
     dead: set[int] = set()            # services whose make-up session failed: not retried
@@ -552,6 +567,9 @@ def _make_up_checks(plan, sampler: _DedupSampler, make_client,
             errors.append(_checks_stopped(e, "after the sweep"))
             break
         except Exception as e:
+            if _throttling():
+                errors.append(_checks_stopped(e, "after the sweep"))
+                break
             errors.append(_check_not_made(svc, staff_id, day, e))
             dead.add(idx)
             continue
@@ -596,12 +614,14 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
     probe = make_client(cache=cache, cache_ns="")
     try:
         services, service_staff_ids = probe.bootstrap()
-    except BudgetExhausted as e:
-        # Throttled before we could even read the catalog. There is no plan to walk, but
-        # this still has to look like every other untrusted fetch — a clean ok=False result
-        # the caller can artifact and exit 2 on — rather than a traceback that reports a
-        # throttle window as a crash. Other bootstrap failures stay loud: a missing obg or
-        # an unparseable catalog is a shape change, not a rate limit.
+    except (BudgetExhausted, timely.RetriesExhausted) as e:
+        # Throttled (or never answered) before we could even read the catalog. There is no
+        # plan to walk, but this still has to look like every other untrusted fetch — a
+        # clean ok=False result the caller can artifact and exit 2 on — rather than a
+        # traceback that reports a throttle window as a crash. RetriesExhausted is the
+        # common form: one 429'd GET that used up its retries trips no stop condition, so
+        # it used to escape here as a bare TimelyError. Other bootstrap failures stay loud:
+        # a missing obg or an unparseable catalog is a shape change, not a rate limit.
         print(f"::error::fetch aborted during bootstrap: {e}", file=sys.stderr)
         return FetchResult(slots=[], events=[], notices=None, ok=False,
                            lookups_ok=0, lookups_failed=0, lookups_expected=0,
@@ -832,8 +852,13 @@ def fetch(config: Config, tz: ZoneInfo | None = None, *, client_factory=None,
     # on an aborted run, which is mid-back-off and untrusted anyway, nor after a stop
     # condition on the last service's check, nor once the memo has already been caught out,
     # nor on a run too thin to trust whatever they find: each check here can cost a session
-    # and two of the funnel POSTs Timely rate-limits, on a run that will write nothing.
-    if enough and not aborted and not checks_stopped and memo_trusted and sampler.left:
+    # and two of the funnel POSTs Timely rate-limits, on a run that will write nothing. Nor
+    # while Timely is throttling an endpoint as the sweep ends (see _throttling): a storm
+    # that starts on the last services would otherwise take more sessions into it, five
+    # 429s and their Retry-After waits apiece, until a stop condition tripped. A throttle
+    # the sweep has since recovered from leaves no streak, and costs no checks.
+    if (enough and not aborted and not checks_stopped and memo_trusted and sampler.left
+            and not _throttling()):
         made, broken = _make_up_checks(plan, sampler, make_client,
                                        service_staff_ids, errors)
         saved -= made

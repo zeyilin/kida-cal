@@ -744,6 +744,83 @@ def test_a_service_whose_make_up_session_would_not_open_is_not_tried_again():
     assert [ns for ns, _ in FakeClient.sessions] == ["", "svcA", "svcB", "svcB"]
 
 
+SERVICE_POST = f"{timely.BASE}/Booking/Service?obg=fake"
+
+
+class ThrottledPost(FiveCuts):
+    """FiveCuts, with /Booking/Service throttled the way TimelyClient reports a request that
+    spends all 5 attempts on 429s short of a stop condition: BUDGET.throttled(), then a
+    plain TimelyError. A POST that goes through clears the streak, as a real 200 does."""
+    for_services: set = set()     # cache_ns whose sweep session's POST is throttled
+    for_sessions: set = set()     # session numbers whose POST is throttled
+
+    def select_service(self, bookable_item_id, service_staff_ids):
+        if self.ns in self.for_services or self.n in self.for_sessions:
+            timely.BUDGET.throttled("POST", SERVICE_POST)
+            raise timely.TimelyError(f"429 from {SERVICE_POST} after retries")
+        timely.BUDGET.cleared("POST", SERVICE_POST)
+        super().select_service(bookable_item_id, service_staff_ids)
+
+
+def _throttled_post(services=(), sessions=()):
+    ThrottledPost.diverge = set()
+    ThrottledPost.for_services, ThrottledPost.for_sessions = set(services), set(sessions)
+    # 8 checks for FiveCuts' 8 memo-served pairs: each memo-served service takes one as its
+    # walk ends, whatever the draw, and the rest are left for after the sweep.
+    return fetch(mkconfig(lookahead_days=10, verify_dedup_samples=8),
+                 client_factory=ThrottledPost, rng=random.Random(0))
+
+
+def test_no_check_is_made_after_a_sweep_that_ends_on_a_throttle():
+    """s5's /Booking/Service spends all its retries on 429s: a storm starting on the last
+    service. Its two lookups fail, 8 of 10 land and the run is trusted, but it ended on a
+    throttle streak, and every make-up session sends that same POST again. They used to go
+    out all the same — more 429'd sessions, and their Retry-After waits, until the streak
+    stopped them, all after every lookup had landed."""
+    result = _throttled_post(services={"s5"})
+
+    assert result.ok
+    assert result.lookups_ok == 8 and result.lookups_expected == 10
+    assert any("Cut 5: funnel setup failed" in e for e in result.errors)
+    assert len(FakeClient.sessions) == 6        # the probe and s1..s5; nothing after
+
+
+def test_a_throttle_the_sweep_recovered_from_costs_no_checks():
+    """s3's /Booking/Service is throttled, s4's goes through: the throttle is over by the
+    time the sweep ends, so the checks left go out as on any other run. A gate on 'any
+    throttle this run' would drop them on every run that saw one stray 429'd request."""
+    result = _throttled_post(services={"s3"})
+
+    assert result.ok
+    assert result.lookups_ok == 8
+    # The probe and s1..s5, then one make-up session each for s2, s4 and s5's other pair.
+    assert sorted(ns for ns, _ in FakeClient.sessions[6:]) == ["s2", "s4", "s5"]
+
+
+@pytest.mark.parametrize("fail", ["throttle", "error"])
+def test_a_throttle_in_a_make_up_session_stops_the_checks(fail):
+    """Session 6 is the first opened after the sweep, with three more services still to
+    check. Throttled short of a stop condition, it used to be passed over like any session
+    that would not open, and the next service's session sent the same POST into the same
+    throttle — five more 429s apiece until the streak tripped. Now the first one stops the
+    checks. A session that fails for any other reason still only costs its own service."""
+    if fail == "throttle":
+        result = _throttled_post(sessions={6})
+    else:
+        FakeClient.fail_sessions = {6}
+        result = _throttled_post()
+
+    assert result.ok
+    assert not any("run aborted" in e for e in result.errors)
+    if fail == "throttle":
+        assert any("spot-checks stopped after the sweep: 429" in e for e in result.errors)
+        assert not any("spot-check not made" in e for e in result.errors)
+        assert len(FakeClient.sessions) == 7
+    else:
+        assert len([e for e in result.errors if "spot-check not made" in e]) == 1
+        assert len(FakeClient.sessions) == 10
+
+
 class BookedLate(FakeClient):
     """Every session from `booked_from` on sees each day with its 10:00 opening gone — what
     a booking made while the sweep ran looks like, to every service alike. `split` services
@@ -897,6 +974,38 @@ def test_a_throttle_during_the_opening_bootstrap_is_still_a_clean_untrusted_resu
     assert result.lookups_expected == 0
     assert result.staff_ok == set()
     assert any("run aborted" in e for e in result.errors)
+
+
+def test_a_bootstrap_that_ran_out_of_retries_is_a_clean_untrusted_result(monkeypatch):
+    """The usual shape of a 429 storm at the opening request: one GET that 429s through
+    all its retries. That trips no stop condition, so it surfaces as RetriesExhausted, not
+    BudgetExhausted — and it used to escape fetch() as a traceback."""
+    real = FakeClient.bootstrap
+
+    def throttled_probe(self):
+        if self.ns == "":
+            raise timely.RetriesExhausted("429 from https://book.gettimely.com/x after retries")
+        return real(self)
+
+    monkeypatch.setattr(FakeClient, "bootstrap", throttled_probe)
+    result = _fetch()
+
+    assert result.ok is False
+    assert result.lookups_expected == 0
+    assert result.staff_ok == set()
+    assert result.staff_planned is None
+    assert any("run aborted" in e for e in result.errors)
+
+
+def test_a_bootstrap_shape_change_still_fails_loudly(monkeypatch):
+    """A page that answered but has no obg is a shape change, not a bad moment on Timely's
+    side: it must stay a crash, not become an exit-2 'try again next run'."""
+    def shape_changed(self):
+        raise timely.TimelyError("could not find obg on landing page")
+
+    monkeypatch.setattr(FakeClient, "bootstrap", shape_changed)
+    with pytest.raises(timely.TimelyError, match="obg"):
+        _fetch()
 
 
 def test_an_aborted_sweep_is_untrusted_even_when_most_lookups_landed():

@@ -325,7 +325,7 @@ def build_entries(events: list[Event], style: str):
 
 # ---------------------------------------------------------------- (de)serialization
 # Used by --fetch-json / --from-json so a write-side failure does not cost another
-# ~5,000-request, 85-minute Timely sweep to reproduce.
+# ~1,700-request, ~40-minute Timely sweep to reproduce.
 def event_to_dict(ev: Event) -> dict:
     return {
         "stylist_id": ev.stylist_id,

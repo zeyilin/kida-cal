@@ -54,6 +54,19 @@ hours first, so that issue can take up to a day to open.
 To retry a failed run straight away, use **Re-run all jobs** on it: a re-run always
 checks, even within the 50 minutes.
 
+If every run fails with "refusing to delete … looks partial" while KIDA's site is fine —
+say the salon moved its hours, or you narrowed `stylists` to a few names — the safety
+check is blocking a change that is real. Clear it once from your own computer, with the
+service-account key file and the calendar id:
+
+```
+pip install --require-hashes -r requirements-lock.txt
+KIDA_SERVICE_ACCOUNT_JSON=path/to/key.json KIDA_CALENDAR_ID=<calendar id> \
+  python -m src.sync_calendar --depth full --allow-mass-delete
+```
+
+The scheduled runs can't do this themselves, on purpose.
+
 ### Getting a reliable hourly refresh
 
 GitHub's scheduler is the weak link. For a run every hour, have an outside cron service

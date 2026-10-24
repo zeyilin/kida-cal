@@ -247,9 +247,10 @@ def _exhaust(clock, make_outcome, latency, staff):
 def test_exhausted_requests_each_fail_one_lookup_and_never_stop_the_run(clock, make_outcome,
                                                                          latency):
     """A request that spends all five attempts without a usable answer fails its one lookup
-    — a plain TimelyError — however many follow it, for however many stylists and
-    sessions, over however long. A streak of them used to stop the run, and even once it
-    had to span two stylists, two sessions and five minutes it aborted (exit 2, nothing
+    — a RetriesExhausted, which is a TimelyError and never a BudgetExhausted — however
+    many follow it, for however many stylists and sessions, over however long. A streak of
+    them used to stop the run, and even once it had to span two stylists, two sessions and
+    five minutes it aborted (exit 2, nothing
     written) sweeps that otherwise stayed trusted: a 6-min window of fast 503s on
     gettimeslots at ~15 simulated min, and a 16-min one with Retry-After: 60 at ~22 —
     sweeps which without the streak lost 8 and 3 of 60 lookups. Ending a hopeless run is
@@ -265,7 +266,7 @@ def test_exhausted_requests_each_fail_one_lookup_and_never_stop_the_run(clock, m
         assert _client(FakeSession(200, body='{"openDates": []}')).open_dates(
             staff, 9, 2026) == []                                # GetOpenDates is healthy
         e = _exhaust(clock, make_outcome, latency, staff)
-        assert type(e) is TimelyError, e                         # one lookup lost; run goes on
+        assert type(e) is timely.RetriesExhausted, e             # one lookup lost; run goes on
         n += 1
     assert timely.BUDGET.throttled_total == 0
 

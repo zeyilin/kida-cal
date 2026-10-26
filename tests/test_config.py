@@ -69,11 +69,75 @@ def test_known_keys_still_load(tmp_path):
     {"min_slot_hour": 99},
     {"request_delay_seconds": -1},
     {"timezone": "Mars/Olympus_Mons"},
+    {"verify_dedup_samples": -1},
+    {"verify_dedup_samples": "four"},
+    {"verify_dedup_samples": True},
 ])
 def test_invalid_values_fail_loudly_at_startup(tmp_path, bad):
     path = _write(tmp_path, dict(MINIMAL, **bad))
     with pytest.raises(SystemExit):
         Config.load(path)
+
+
+def test_zero_dedup_samples_is_a_valid_way_to_turn_the_checks_off(tmp_path):
+    assert Config.load(_write(tmp_path, dict(MINIMAL, verify_dedup_samples=0))) \
+        .verify_dedup_samples == 0
+
+
+# --------------------------------------------------------------- timezone
+@pytest.mark.parametrize("tz", ["Europe/London", "UTC", "America/Chicago", "US/Eastern"])
+def test_only_the_zone_timely_answers_in_is_accepted(tmp_path, tz):
+    """These are all real zones, so the old 'does it load?' check passed them. But every
+    request asks Timely for tzId=80 and gets New York wall-clock minutes back; stamping
+    those with any other zone shifts every published opening. Even US/Eastern, an alias
+    with the same rules, is refused: one spelling, no judgement calls."""
+    path = _write(tmp_path, dict(MINIMAL, timezone=tz))
+    with pytest.raises(SystemExit, match=r"America/New_York.*tzId=80"):
+        Config.load(path)
+
+
+# --------------------------------------------------------------- stylist / service filters
+@pytest.mark.parametrize("key, given, expected", [
+    ("stylists", "Nao", ["Nao"]),          # one name is a one-item list...
+    ("services", "Buzz", ["Buzz"]),        # ...never the letters N, a, o
+    ("stylists", "  Nao ", ["Nao"]),
+    ("stylists", "all", "all"),
+    ("services", "ALL", "all"),
+    ("stylists", ["Nao", "Aki"], ["Nao", "Aki"]),   # "Aki" matches "Taka (Aki)"
+    ("services", ["Hair Cut", "Buzz"], ["Hair Cut", "Buzz"]),
+])
+def test_filters_are_normalised(tmp_path, key, given, expected):
+    cfg = Config.load(_write(tmp_path, dict(MINIMAL, **{key: given})))
+    assert getattr(cfg, key) == expected
+
+
+@pytest.mark.parametrize("key, bad", [
+    ("stylists", 5),
+    ("stylists", True),
+    ("stylists", {"name": "Nao"}),
+    ("stylists", None),              # used to fall through `not allow` and mean "all"
+    ("stylists", []),                # ...as did a list whose every name was removed
+    ("stylists", ["Nao", 5]),
+    ("stylists", ["Nao", ""]),       # "" is a substring of every name
+    ("stylists", ["all"]),           # would be matched as the substring "all"...
+    # ...but that one is refused by the stylist-name check too, so only this one pins the
+    # rule. Without it this loads, matches no service, and every run ends with an empty
+    # plan and exit 2 instead of failing at startup.
+    ("services", ["all"]),
+    ("services", ""),
+    ("services", ["Hair Cut", None]),
+])
+def test_filters_that_are_not_names_are_refused(tmp_path, key, bad):
+    with pytest.raises(SystemExit, match=key):
+        Config.load(_write(tmp_path, dict(MINIMAL, **{key: bad})))
+
+
+def test_a_stylist_name_that_matches_nobody_is_refused(tmp_path):
+    """A typo cannot filter FOR anyone, and a stylist the plan never looks for is treated
+    as gone from the salon — so `[Nao, Sachii]` would prune Sachi's calendar entries
+    rather than keep them."""
+    with pytest.raises(SystemExit, match="Sachii"):
+        Config.load(_write(tmp_path, dict(MINIMAL, stylists=["Nao", "Sachii"])))
 
 
 def test_booleans_are_not_accepted_as_integers(tmp_path):

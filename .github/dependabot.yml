@@ -1,11 +1,19 @@
 version: 2
 
-# Two jobs at once:
-#  1. Action version bumps arrive as reviewable PRs, which is the only sane way to keep
-#     SHA pins current on a workflow that holds a Google write credential.
-#  2. The PR traffic is real repository activity, which resets the ~60-day clock GitHub
-#     uses to auto-disable scheduled workflows. (This replaces keepalive.yml, which
-#     needed a PAT that was never set and therefore never pushed anything.)
+# Action version bumps (and the Python lock-file pins below) arrive as reviewable PRs,
+# which is the only sane way to keep SHA pins current on a workflow that holds a Google
+# write credential.
+#
+# This is NOT a keepalive for the ~60-day clock GitHub uses to auto-disable scheduled
+# workflows, though this comment used to say it was (it replaced keepalive.yml, which
+# needed a PAT that was never set and therefore never pushed anything). Its PRs sit
+# unmerged — the 8 open ones date from 2026-07-25, 08-10 and 09-07. The pip ecosystem is at
+# its open-pull-requests-limit (5) and opens nothing new until some are merged or closed;
+# github-actions is not (3 open) and still opens the odd PR — its latest, 2026-09-07, came
+# a month after pip filled up — but those sit unmerged as well. Whatever Dependabot
+# activity counts, there is little of it; merging the PRs (a real commit) would reset the
+# clock, their mere existence cannot be counted on. The heartbeat in sync.yml
+# (KIDA_HEARTBEAT_URL) is what notices a schedule that has stopped.
 updates:
   - package-ecosystem: github-actions
     directory: "/"

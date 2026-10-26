@@ -1,25 +1,54 @@
 name: sync-open-slots
 
 # LIVE calendar path: write open slots straight into a Google Calendar via the API, which
-# reflects in your (and any subscriber's native Google) calendar within the hour — unlike
-# the .ics-URL subscription, which Google refreshes slowly.
+# shows up in your (and any subscriber's native Google) calendar as soon as a run finishes
+# — unlike the .ics-URL subscription, which Google refreshes only every 8-24h.
 #
 # Auth: a Google service account (secrets.KIDA_SERVICE_ACCOUNT_JSON). The target calendar
 # (secrets.KIDA_CALENDAR_ID) must be shared with the service account's email with
 # "Make changes to events". See README.
 #
 # This workflow also publishes the .ics feed to GitHub Pages (folded in from the old
-# feed.yml) so the calendar and the feed come from ONE fetch and cannot disagree.
+# feed.yml and its src/build_feed.py, both since deleted) so the calendar and the feed
+# come from ONE fetch and cannot disagree.
 
 on:
   schedule:
-    # :23 past the hour, deliberately NOT :00. GitHub drops scheduled ticks that cluster
-    # on the top of the hour when the scheduler is loaded — measured on this repo, only
-    # 100 of 180 top-of-hour ticks were ever delivered (p90 gap 175 min).
+    # Four chances an hour, because GitHub does not deliver an hourly cron. With the single
+    # "23 * * * *" line this used to have, runs landed ~1-2h apart in early Aug 2026; since
+    # late Sep the median gap has been 5-6h (6.3h the week of 2026-10-05, max 9h) — about 4
+    # of the 24 hourly ticks a day arrive. Each line below is its own schedule entry, so
+    # each is a separate chance to be delivered, and a dropped :23 no longer costs the
+    # whole hour. None is on :00: GitHub drops ticks that cluster on the top of the hour
+    # when the scheduler is loaded (measured on this repo: 100 of 180 top-of-hour ticks
+    # ever delivered, p90 gap 175 min).
+    #
+    # The surplus costs Timely nothing. Every run passes --skip-if-checked-within (job env
+    # below; only a re-run, which a person asked for, passes 0): a tick landing under 50
+    # min after the last run STARTED — start-to-start, read off the calendar's status
+    # marker before any Timely request — exits 0 in ~30 seconds having made a couple of
+    # calendar reads and no Timely request at all. So at most one sweep STARTS per ~50 min
+    # however many ticks arrive (a sweep that itself runs 50+ min can be followed at once
+    # by the tick queued behind it; docs/compliance.md); with all four on time that
+    # settles at hourly (:08 + 50 = :58, so the next sweep is the following :08). 50 rather
+    # than 60 is slack for delivery jitter: at 60, a sweep whose tick arrived two minutes
+    # late would make the next hour's on-time :08 skip, and that hour's sweep would wait
+    # 15 minutes for the :23.
+    #
+    # If this is still not enough, README "Getting a reliable hourly refresh" — an external
+    # cron dispatching this workflow — does not depend on GitHub's scheduler at all.
+    - cron: "8 * * * *"
     - cron: "23 * * * *"
+    - cron: "38 * * * *"
+    - cron: "53 * * * *"
   workflow_dispatch:
     inputs:
       depth:
+        # auto goes through the same freshness gate as a scheduled tick (it is what the
+        # README's external trigger sends); near/full are a person asking for a run now,
+        # and the program never gates those — once they start. Nor is a re-run of any run
+        # gated (see "Sync calendar"). One dispatched while a run is in progress can be
+        # replaced before it starts; see the concurrency note below.
         description: "Lookahead depth (auto = the program decides from the calendar marker)"
         type: choice
         default: auto
@@ -28,7 +57,20 @@ on:
           - near
           - full
 
-# Never run two syncs at once (they'd race on the same events).
+# Never run two syncs at once (they'd race on the same events). Runs that arrive during a
+# sweep wait behind it, but GitHub keeps at most ONE pending run per group: each newly
+# queued run cancels the pending one and takes its place. The cancelled ones never started
+# a step, so they report nothing. For a surplus tick that costs nothing — the run that
+# does get to start mostly skips at the gate anyway.
+#
+# For a manual near/full dispatch (or a re-run) it costs the run. Started while a sweep is
+# in progress, it waits as the pending run; the next scheduled tick or external trigger
+# (depth auto) replaces it, and that run then usually skips at the gate, since the sweep
+# it waited behind started under 50 min before. The run someone asked for never happens
+# and shows only as a cancelled run. With four cron lines and the README's external
+# trigger that is likely, not a corner case. Splitting the group would avoid it only by
+# letting syncs race, so instead: dispatch near/full when no run is in progress, and if it
+# shows as cancelled, dispatch it again (README says the same).
 concurrency:
   group: sync-open-slots
   cancel-in-progress: false
@@ -39,8 +81,9 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # Observed deep (90-day) sweeps take ~38 min; near-term sweeps ~7 min (2026-08-09:
-    # 37m50s / 1,575 requests and 6m59s / 240 requests). The 82-85 min this comment used to
+    # Observed deep (90-day) sweeps take ~40 min / ~1,700 requests and near-term sweeps
+    # ~10 min / ~385 requests (October 2026 production runs; docs/compliance.md has the
+    # table, and the lower 2026-08-09 measurement). The 82-85 min this comment used to
     # quote was the pre-de-duplication figure and had been stale since that landed. The
     # generous 120 stays: it is headroom for a slow Timely day, and the throttle stop
     # conditions — not this timeout — are what end a run we are being rate-limited out of.
@@ -48,6 +91,10 @@ jobs:
     permissions:
       contents: read
       issues: write # the failure-report step files/comments on an issue
+    env:
+      # The freshness gate's window, in minutes. One value, read by the sync step (which
+      # passes it to the program), the run summary and the heartbeat, so they cannot drift.
+      SKIP_IF_CHECKED_WITHIN_MINUTES: "50"
     outputs:
       publish: ${{ steps.ics.outputs.publish }}
     steps:
@@ -63,11 +110,11 @@ jobs:
         run: |
           missing=0
           if [ -z "$SA" ]; then
-            echo "::error::Secret KIDA_SERVICE_ACCOUNT_JSON is not set. Add the service-account key JSON under Settings → Secrets and variables → Actions. See README Path A."
+            echo "::error::Secret KIDA_SERVICE_ACCOUNT_JSON is not set. Add the service-account key JSON under Settings → Secrets and variables → Actions. See README, \"If you're running your own copy\"."
             missing=1
           fi
           if [ -z "$CID" ]; then
-            echo "::error::Secret KIDA_CALENDAR_ID is not set. Add the target calendar id under Settings → Secrets and variables → Actions. See README Path A."
+            echo "::error::Secret KIDA_CALENDAR_ID is not set. Add the target calendar id under Settings → Secrets and variables → Actions. See README, \"If you're running your own copy\"."
             missing=1
           fi
           [ "$missing" -eq 0 ] || exit 1
@@ -80,7 +127,7 @@ jobs:
 
       # Hash-pinned. This job holds a Google service-account key with write access to a
       # calendar, so it installs an exact, verified dependency set rather than resolving
-      # whatever is newest on PyPI at 23 past the hour. Regenerate after editing
+      # whatever is newest on PyPI the moment a tick lands. Regenerate after editing
       # requirements-calendar.txt with the command in the lock file's header.
       - name: Install dependencies
         run: pip install --require-hashes -r requirements-lock.txt
@@ -94,10 +141,30 @@ jobs:
           umask 077
           printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa-key.json"
 
+      # Besides exit-code (below), the program writes outputs of its own to $GITHUB_OUTPUT.
+      # These two come BEFORE it sends Timely anything, so they exist even when the fetch
+      # dies:
+      #   skipped                 true = the freshness gate stopped this tick (exit 0, no
+      #                           Timely request, nothing written); false = it ran.
+      #   last_success_age_hours  hours since the last SUCCESSFUL sync — the last run that
+      #                           exited 0; a run that exits 1 or 2 leaves it alone — to one
+      #                           decimal, e.g. 3.2. Empty when unknown: no successful sync
+      #                           is recorded on the calendar's status marker (no marker
+      #                           yet, or one that no run has succeeded on), or the run died
+      #                           before it could read the marker.
+      # (It also writes `deep` once the fetch returns; nothing here reads it.)
+      # Every later step keys off these rather than guessing from files on disk.
+      #
+      # A re-run is not gated. "Re-run jobs" reuses the original run's event, so re-running
+      # a failed scheduled run is depth auto again — and the gate would read the failed
+      # attempt's own start stamp and turn the retry into a green no-op that leaves the
+      # calendar stale and the failure issue open. Like a near/full dispatch, a re-run is a
+      # person asking for a run now. GitHub never re-runs anything by itself, so
+      # GITHUB_RUN_ATTEMPT > 1 means exactly that.
       - name: Sync calendar
         id: sync
         env:
-          # 13-85 minutes of silence otherwise, with the progress line buffered until it
+          # 10-40 minutes of silence otherwise, with the progress line buffered until it
           # lands mid-traceback.
           PYTHONUNBUFFERED: "1"
           KIDA_SERVICE_ACCOUNT_JSON: ${{ runner.temp }}/sa-key.json
@@ -111,9 +178,15 @@ jobs:
           DEPTH: ${{ github.event.inputs.depth || 'auto' }}
         run: |
           mkdir -p public
+          gate="$SKIP_IF_CHECKED_WITHIN_MINUTES"
+          if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
+            gate=0
+            echo "::notice::Re-run (attempt ${GITHUB_RUN_ATTEMPT}): a person asked for this run, so the freshness gate is off."
+          fi
           set +e
           python -m src.sync_calendar \
             --depth "$DEPTH" \
+            --skip-if-checked-within "$gate" \
             --ics public/open_slots.ics \
             --fetch-json fetch-result.json
           code=$?
@@ -125,9 +198,11 @@ jobs:
           exit "$code"
 
       # Keep the fetch even when the write side blows up, so debugging a 409 or a bad
-      # dedupe doesn't cost another 85-minute Timely sweep.
+      # dedupe doesn't cost another ~40-minute deep sweep. Not on a skipped run: it fetched
+      # nothing, so there is no file, and if-no-files-found would put a warning on every
+      # surplus tick.
       - name: Upload fetch result
-        if: always()
+        if: always() && steps.sync.outputs.skipped != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fetch-result
@@ -135,8 +210,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Not on a skipped run, which wrote no .ics and has nothing to publish. Leaving the
+      # step out leaves `publish` empty, which deploy-pages already reads as "keep the
+      # previous deployment live".
       - name: Check .ics before publishing
         id: ics
+        if: steps.sync.outputs.skipped != 'true'
         run: |
           f=public/open_slots.ics
           if [ ! -s "$f" ]; then
@@ -164,21 +243,42 @@ jobs:
         with:
           path: public
 
+      # Four ticks an hour means most rows in the run list are skips; the summary says so
+      # up front, so a skip is never mistaken for a sync that found nothing.
+      #
+      # last_success_age_hours is measured when the run STARTED, so on a run whose sync
+      # exited 0 (and was not a skip) it is the gap before this one, not the age of the
+      # calendar: the last successful sync is this run (same test as Report failure).
       - name: Run summary
         if: always()
         env:
           DEPTH: ${{ github.event.inputs.depth || 'auto' }}
           EXIT_CODE: ${{ steps.sync.outputs.exit-code }}
+          SKIPPED: ${{ steps.sync.outputs.skipped }}
+          LAST_OK_AGE: ${{ steps.sync.outputs.last_success_age_hours }}
           ICS_EVENTS: ${{ steps.ics.outputs.events }}
           PUBLISH: ${{ steps.ics.outputs.publish }}
         run: |
+          if [ "${EXIT_CODE:-}" = "0" ] && [ "${SKIPPED:-}" != "true" ]; then
+            last_ok="this run${LAST_OK_AGE:+ (previous: ${LAST_OK_AGE} h before it started)}"
+          elif [ -n "$LAST_OK_AGE" ]; then
+            last_ok="${LAST_OK_AGE} h before this run"
+          else
+            last_ok="unknown"
+          fi
           {
             echo "### sync-open-slots"
             echo
+            if [ "$SKIPPED" = "true" ]; then
+              echo "> **Skipped by the freshness gate.** The last run started less than ${SKIP_IF_CHECKED_WITHIN_MINUTES} minutes ago (\`--skip-if-checked-within\`, measured start-to-start), so this tick sent Timely nothing and left the calendar as that run left it."
+              echo
+            fi
             echo "| field | value |"
             echo "| --- | --- |"
             echo "| trigger | \`${GITHUB_EVENT_NAME}\` |"
             echo "| depth requested | \`${DEPTH}\` |"
+            echo "| skipped (freshness gate) | ${SKIPPED:-unknown} |"
+            echo "| last successful sync | ${last_ok} |"
             echo "| sync exit code | \`${EXIT_CODE:-did not run}\` |"
             echo "| open slots in .ics | ${ICS_EVENTS:-n/a} |"
             echo "| publishing to Pages | ${PUBLISH:-false} |"
@@ -199,13 +299,37 @@ jobs:
       # and have it alert when a ping does not arrive. Optional by design: absent secret
       # skips cleanly. A failed ping is a warning, not a job failure — the sync itself
       # succeeded, and the external monitor will alert on the missing ping anyway.
+      #
+      # A skipped run pings too, but only while the calendar really is fresh. The gate
+      # counts ATTEMPTS: the program stamps a run's start on the marker before it fetches,
+      # so a run that then fails gates the ticks behind it exactly like one that succeeded.
+      # Pinging on every skip would let those surplus ticks vouch for the failed run — up to
+      # three pings an hour through an outage, and the switch would never fire. So a skipped
+      # run pings only while the last SUCCESSFUL sync (last_success_age_hours; only a run
+      # that exits 0 moves it, so failures of either kind just let it age) is under the gate
+      # window. The age arrives rounded to a tenth of an hour, so the check uses the top of
+      # that rounding: "0.8" may be 51 minutes, and does not count.
+      #
+      # That is a promise about the calendar, not about the run the tick deferred to. A run
+      # that fails straight after a long sweep can still be followed by a ping while that
+      # sweep's result is under 50 minutes old — the calendar is fresh then. What it does
+      # guarantee is that an outage stops the pings no later than 50 minutes after the last
+      # success, so the switch fires on its own schedule. (It was not true while a run that
+      # exited 1 still advanced last_run: then every failure re-armed the pings.)
       - name: Heartbeat
         if: success()
         env:
           HEARTBEAT_URL: ${{ secrets.KIDA_HEARTBEAT_URL }}
+          SKIPPED: ${{ steps.sync.outputs.skipped }}
+          LAST_OK_AGE: ${{ steps.sync.outputs.last_success_age_hours }}
         run: |
           if [ -z "$HEARTBEAT_URL" ]; then
             echo "::notice::KIDA_HEARTBEAT_URL not set — no dead-man's switch. Dropped cron ticks and the 60-day auto-disable will go unnoticed."
+            exit 0
+          fi
+          if [ "$SKIPPED" = "true" ] && ! awk -v h="$LAST_OK_AGE" -v m="$SKIP_IF_CHECKED_WITHIN_MINUTES" \
+              'BEGIN { exit !(h != "" && (h + 0.05) * 60 < m + 0) }'; then
+            echo "::notice::Skipped tick, but the last successful sync was ${LAST_OK_AGE:-at an unknown time}${LAST_OK_AGE:+ h ago} — not pinging, so the monitor can see the calendar is not being refreshed."
             exit 0
           fi
           if curl -fsS -m 10 --retry 3 -o /dev/null "$HEARTBEAT_URL"; then
@@ -218,8 +342,12 @@ jobs:
       # and "is there an open sync-failure issue?" stops being a signal at all — which is
       # exactly what happened after two deliberately-cancelled runs left #5 standing while
       # every subsequent sync was green.
+      #
+      # Only when the sync actually RAN and succeeded. A skipped tick proves nothing: the
+      # run it deferred to may be the very one that failed (see Heartbeat), and closing the
+      # issue as "Recovered" off its back would be a lie.
       - name: Clear failure issue on recovery
-        if: success()
+        if: success() && steps.sync.outputs.skipped != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -230,10 +358,45 @@ jobs:
               && echo "::notice::Closed recovered failure issue #${num}"
           done
 
-      # One issue for a failure streak, not one notification per run: 59 identical
-      # failures become 1 issue + 58 comments. cancelled() is included because a run
-      # cancelled mid-flight (manual cancel, or the concurrency group killing it) is
-      # otherwise completely silent.
+      # One issue for an outage, not one per blip. This used to open an issue on every
+      # failure that found none open — and with failures alternating with successes, each
+      # failure opened a fresh issue that the next success closed: 116 auto-filed issues
+      # between 2026-07-25 and 2026-10-03, nearly all about a calendar that was fine again
+      # within hours. Now:
+      #   - an open sync-failure issue gets a comment, as before (one issue per streak);
+      #   - otherwise an issue opens only when the calendar has gone STALE_ALERT_HOURS or
+      #     more without a successful sync (last_success_age_hours, which the program
+      #     publishes before it fetches), or when that age is UNKNOWN: the run failed
+      #     before it could read the calendar's status marker (missing secret, bad key,
+      #     Google down — or a step before the program, so a passing checkout or
+      #     pip-install blip too), or the marker records no successful sync at all (a new
+      #     setup whose runs have all failed, or no marker yet). An unknown age can
+      #     therefore be a blip, and it still opens the issue: with no age there is
+      #     nothing to tell it from a break that fails every run the same way (a missing
+      #     secret, a revoked key, a broken lock file), which waiting for a threshold
+      #     would leave silent for good. The next run that syncs closes it;
+      #   - a run whose sync step itself exited 0 has just refreshed the calendar, so
+      #     whatever failed after it (an artifact upload, say) is not a stale calendar,
+      #     whatever the age measured BEFORE the sweep says. It comments on an open issue
+      #     like any failure, but never opens one; a ::warning:: says what happened. (A
+      #     skipped tick also exits 0 but refreshed nothing, so it gets the age rule.)
+      #   - anything else is a ::warning:: on the run. A failure streak crosses the
+      #     threshold by itself and opens the issue then: only a run that exits 0 advances
+      #     the age's starting point, so through a streak — exit 1 as much as exit 2 — it
+      #     only grows. (main() used to stamp it on runs about to exit 1 as well; under
+      #     that, a persistent exit 1 read ~6h old on every run and this rule could never
+      #     fire. tests/test_workflow.py now runs the program and this step back to back.)
+      #     A streak of failing DEEP sweeps gets there later. The program sweeps near
+      #     after each one, and those near runs succeed, until the last clean deep sweep
+      #     is 12h old (NEAR_FALLBACK_HOURS, src/sync_calendar.py); from then on every
+      #     run goes deep, nothing exits 0, and the age grows. So that issue opens 12-24h
+      #     after the last clean deep sweep, the near window refreshed for the first half.
+      # The age is measured when the run STARTED, so a deep sweep that fails ~40 min in is
+      # judged a little young; the next failure catches up.
+      #
+      # cancelled() is included because a run cancelled mid-flight (by hand, or by hitting
+      # timeout-minutes, which GitHub implements as a cancel) is otherwise completely silent.
+      # It goes through the same staleness rule as a failure.
       - name: Report failure
         if: failure() || cancelled()
         env:
@@ -241,16 +404,31 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EXIT_CODE: ${{ steps.sync.outputs.exit-code }}
+          SKIPPED: ${{ steps.sync.outputs.skipped }}
+          LAST_OK_AGE: ${{ steps.sync.outputs.last_success_age_hours }}
+          # Half a day: two to three missed refreshes at GitHub's recent ~4 runs a day,
+          # and the point at which README tells readers the calendar is stale.
+          STALE_ALERT_HOURS: "12"
         run: |
           set -uo pipefail
           gh label create sync-failure \
             --color B60205 \
             --description "sync-open-slots is failing (opened automatically)" >/dev/null 2>&1 || true
 
-          body=$(printf '%s\n\n%s\n%s\n%s\n%s\n' \
+          synced=0
+          if [ "${EXIT_CODE:-}" = "0" ] && [ "${SKIPPED:-}" != "true" ]; then
+            synced=1
+            age_line="- last successful sync: this run — the sync itself succeeded and refreshed the calendar; a step after it failed"
+          elif [ -n "$LAST_OK_AGE" ]; then
+            age_line="- last successful sync: ${LAST_OK_AGE} h before this run started (issue threshold ${STALE_ALERT_HOURS} h)"
+          else
+            age_line="- last successful sync: unknown — no successful sync is recorded on the calendar's status marker (no marker yet, or none of its runs has succeeded), or this run failed before it could read it"
+          fi
+          body=$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n' \
             "Run **${JOB_STATUS}** at $(date -u +'%Y-%m-%d %H:%M UTC')." \
             "- trigger: \`${GITHUB_EVENT_NAME}\`" \
             "- sync exit code: \`${EXIT_CODE:-did not run}\`" \
+            "$age_line" \
             "- logs: ${RUN_URL}" \
             "- fetch JSON is attached to that run as the \`fetch-result\` artifact (14-day retention).")
 
@@ -258,11 +436,16 @@ jobs:
           if [ -n "$num" ]; then
             gh issue comment "$num" --body "$body"
             echo "::notice::Commented on existing failure issue #${num}"
-          else
+          elif [ "$synced" -eq 1 ]; then
+            echo "::warning::The sync itself succeeded and refreshed the calendar; a later step failed (see the log above). No issue opened: the calendar is not stale."
+          elif [ -z "$LAST_OK_AGE" ] || awk -v h="$LAST_OK_AGE" -v t="$STALE_ALERT_HOURS" \
+              'BEGIN { exit !(h + 0 >= t + 0) }'; then
             gh issue create \
               --title "sync-open-slots is failing" \
               --label sync-failure \
               --body "$body"
+          else
+            echo "::warning::Transient failure: the calendar was last refreshed ${LAST_OK_AGE} h before this run started, under the ${STALE_ALERT_HOURS} h alert threshold, so no issue was opened. One opens if the calendar is still not refreshed by then."
           fi
 
   # The published .ics must always cover the full horizon, so only a deep sweep may
@@ -272,8 +455,9 @@ jobs:
   #
   # The program enforces that itself — it skips the --ics write entirely on a near-tier
   # run — so the workflow needs no knowledge of which tier ran. The `publish` gate simply
-  # observes that no .ics was produced and skips the deploy, leaving the previous, complete
-  # deployment live. Same gate also protects against an empty or truncated file.
+  # observes that no .ics was produced (or, on a skipped tick, that the check never ran)
+  # and skips the deploy, leaving the previous, complete deployment live. Same gate also
+  # protects against an empty or truncated file.
   deploy-pages:
     needs: sync
     if: needs.sync.outputs.publish == 'true'
@@ -296,5 +480,10 @@ jobs:
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
 
 # Note: GitHub disables scheduled workflows after ~60 days with no repository activity
-# (Actions-bot commits don't count). Dependabot's weekly PRs (.github/dependabot.yml) are
-# the activity that keeps this alive; the heartbeat above is what tells you if it stops.
+# (Actions-bot commits don't count). Nothing here reliably prevents that. Dependabot was
+# once credited with it and is not a dependable keepalive: its 8 PRs have sat unmerged
+# since 2026-07-25 / 08-10 / 09-07. The pip side is at its open-PR limit (5) and opens
+# nothing new; the github-actions side still can (3 open, the latest from 2026-09-07), but
+# those sit unmerged too. A commit to the default branch is what reliably resets the
+# clock — merging those PRs would count. The heartbeat above is the only thing that
+# notices when the schedule stops; set KIDA_HEARTBEAT_URL (as of 2026-10-12 it is not set).

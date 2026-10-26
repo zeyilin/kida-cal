@@ -50,13 +50,19 @@ def _no_ambient_env(monkeypatch):
 def mkconfig(**overrides) -> Config:
     """A Config for tests. event_style defaults to whatever PRODUCTION ships, so guards
     calibrated as ratios are exercised against the real denominator — a suite pinned to
-    'slots' while production ran 'blocks' would have validated the wrong arithmetic."""
+    'slots' while production ran 'blocks' would have validated the wrong arithmetic.
+
+    It goes through validate() like Config.load() does: validate() also NORMALISES (one
+    name becomes a one-item list), and a test that bypassed it would exercise a config
+    production can never run with — a bare `stylists="Nao"` where production hands fetch()
+    ["Nao"], or a timezone production refuses to start with."""
     cfg = Config()
     cfg.calendar_id = "cal-under-test"
     cfg.cache_ttl_seconds = 0
     cfg.request_delay_seconds = 0.0
     for k, v in overrides.items():
         setattr(cfg, k, v)
+    cfg.validate()
     return cfg
 
 

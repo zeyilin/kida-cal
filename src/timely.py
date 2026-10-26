@@ -5,10 +5,15 @@ Wraps the stateful cookie + `obg` funnel documented in docs/timely-api.md. No br
 required. One TimelyClient instance == one HTTP session (its own cookie jar), so create
 a fresh client per service (service is baked into the session; staff/date are params).
 
-Politeness: a shared request delay, exponential backoff on 429/5xx, and a hard per-run
-request cap enforced across all clients via a module-level counter. When the host asks us
-to back off for longer than we are willing to sleep, or keeps 429ing, we stop the run and
-report rather than grinding — see docs/compliance.md.
+Politeness: a shared request delay, exponential backoff on 429/5xx (and on connection
+failures and timeouts, which are retried the same way but never counted as throttles),
+and a hard per-run request cap enforced across all clients via a module-level counter.
+When the host asks us to back off for longer than we are willing to sleep, keeps 429ing,
+keeps failing to connect or timing out, or has made the run spend its whole retry-time
+budget waiting out failures, we stop the run and report rather than grinding — the MAX_*
+stop conditions below, and docs/compliance.md. A connection broken
+mid-response (requests' ChunkedEncodingError) is NOT among the retried failures; see the
+note in TimelyClient._request.
 """
 from __future__ import annotations
 
@@ -64,6 +69,70 @@ MAX_CONSECUTIVE_THROTTLES = 3
 # scattering single throttles across all four endpoints still stops promptly.
 MAX_THROTTLED_REQUESTS_PER_RUN = 5
 
+# Attempts that get no USABLE answer — a connection failure, a timeout, or a 5xx — cannot
+# share the throttle counters above: neither a timeout nor a 502 is Timely asking us to
+# slow down, and at 3-and-5 a handful of unlucky reads would abort a healthy sweep as
+# untrusted. They cannot go unbounded either. Once transport failures were retried (5
+# attempts with backoff: ~3 min per request against a host that never answers, instead of
+# the old ~30s), one hung endpoint — the per-step degradation the throttle notes above
+# describe, say GetOpenDates read-timing-out while bootstrap and both POSTs stay healthy —
+# cost every lookup ~3 min. Simulated, a deep sweep then ran ~185 min, well past the
+# 120-min timeout-minutes at which GitHub kills the job (so no fetch artifact, no exit 2,
+# and the sync concurrency group held for two hours). The same endpoint answering every
+# request 503 with Retry-After: 60 had each lookup sit out four waits (~4 min) and ran
+# ~246 simulated min (~126 at Retry-After: 30, ~486 at 120). What runs out in both is
+# time, so the two backstops below bound time: MAX_TRANSPORT_FAILURES_PER_RUN ends the hung
+# endpoint's sweep at ~31 simulated min, MAX_RETRY_SECONDS_PER_RUN the 503ing one's at ~40.
+# Short of those, a request that spends all five attempts on such failures fails its one
+# lookup, and MIN_LOOKUP_SUCCESS_RATIO in fetch_availability decides whether the run is
+# still trusted. (Fast 5xx with no Retry-After cost a lookup ~30s of backoff, so a sweep
+# through an endpoint answering nothing else ends untrusted in about a healthy sweep's time.)
+#
+# Deliberately NOT a stop condition: a streak of consecutive exhausted requests to one
+# endpoint. There was one, and it only ever stopped sooner what the backstops below stop
+# inside the job timeout anyway, while each false trip aborted a run (exit 2, nothing
+# written for any stylist) that would have finished trusted: one stylist's fault (Hiroki
+# alone runs the catalog's last six services, so his requests come back to back, and
+# being deterministic it aborted every run after), one service's, a two-minute 503
+# window. Rules excusing those (no stylist in common, two sessions, five minutes) still
+# aborted, at ~15 and ~22 simulated min, sweeps through a 6-min window of fast 503s on
+# gettimeslots and a 16-min one with Retry-After: 60 — which without the streak lose 8
+# and 3 of 60 lookups and stay trusted. A slower stop costs minutes of a job that ends
+# anyway; a false trip costs whole update cycles.
+#
+# A run-wide cap on failed transport ATTEMPTS — connection failures and timeouts, NOT 5xx
+# — never cleared by any success. Each costs up to ~50s (the 30s timeout, up to 16s of
+# backoff, pacing) whether or not its request then recovers, so this bounds the hung
+# endpoint above (its 50th failed attempt is its 10th request) and a network losing 5% of
+# requests at random, which fails almost no request outright yet still pushed a simulated
+# deep sweep to ~126 min. 50 of them add under 45 min to the observed ~40-min deep sweep —
+# inside the 120-min job timeout — and are ~12x the 4 timeouts that cost the 2026-09-05
+# run its lookups, so ordinary flakiness still recovers rather than aborting.
+#
+# 5xx were counted here for a while, and a 5xx is answered in a fraction of a second, so
+# 50 of them are ~2 min of backoff, not ~40 min. Counting them aborted runs that lost
+# nothing: a simulated sweep in which ~3.5% of attempts got a fast 503, every request
+# recovering on its retry, was stopped at the 50th 503 having spent 2 min on retries; and
+# one stylist's deterministic 500 interleaved with healthy lookups (Fausto, in nine
+# services: 45 attempts) left room for only five ordinary timeouts in the rest of the run.
+# What a 5xx costs is time — its own latency and any Retry-After it carries — and
+# MAX_RETRY_SECONDS_PER_RUN charges exactly that.
+MAX_TRANSPORT_FAILURES_PER_RUN = 50
+# The backstop under every retry above, measured in the unit that actually runs out:
+# seconds. Each failed attempt of any kind — 429, 5xx, connection failure, timeout — is
+# charged what it cost the run: the time the attempt itself took plus the backoff or
+# Retry-After wait before the next one. When the next wait would take the run's total
+# past this, the run stops instead of sleeping it. The counters above bound HOW MANY
+# requests are throttled or attempts fail to connect; none of them bounds how long Timely
+# may ask us to wait, a 429 that recovers on a late attempt reaches no throttle total, and
+# a 5xx counts toward none of them. Four 429s or 503s with Retry-After: 120 and then a 200
+# cost 8 min — counting toward nothing else at all — and on every gettimeslots call they
+# ran a simulated sweep for ~8 hours. 40 min on top of the observed ~40-min deep sweep
+# keeps the worst case near 80 min, inside the 120-min job timeout with room for setup and
+# the calendar sync — and a healthy run's occasional 429 costs seconds of it, so only a
+# host that keeps asking for long waits, or keeps failing slowly, ever trips it.
+MAX_RETRY_SECONDS_PER_RUN = 40 * 60
+
 _OBG_RE = re.compile(r"/Booking/Service\?obg=([0-9a-f-]{36})")
 _SERVICE_RE = re.compile(
     r'<input[^>]*id="service(\d+)"[^>]*?data-staffids="([^"]*)"[^>]*?'
@@ -84,8 +153,20 @@ class TimelyError(RuntimeError):
     """Raised when the funnel shape is not what recon documented (fail loudly)."""
 
 
+class RetriesExhausted(TimelyError):
+    """One request used up every retry — 429s, 5xx or transport errors, never an answer.
+
+    Inside the sweep it fails its one lookup like any other TimelyError. It is a separate
+    class for the one place that must tell it apart from a shape change: the catalog
+    bootstrap, where a request that never got an answer is a bad moment on Timely's side
+    (exit 2 and retry next run), while a page that answered but lacks the obg or the
+    catalog is a shape change and must stay a loud crash.
+    """
+
+
 class BudgetExhausted(TimelyError):
-    """The per-run request cap or the throttle stop-condition tripped.
+    """The per-run request cap, a throttle stop condition, the run-wide transport-failure
+    cap, or the run-wide retry-time budget tripped.
 
     This is NOT a per-lookup failure: it means the rest of the run's data is missing, so it
     must never be laundered into a failure count that still reports the fetch as healthy.
@@ -93,6 +174,13 @@ class BudgetExhausted(TimelyError):
     explicitly marked untrusted (ok=False, delete authority over nobody) — which keeps every
     downstream guard working and the fetch artifact written, rather than killing the process
     with a traceback on what is now an expected outcome of a throttle window.
+
+    The one exception is a stop condition that trips after every lookup has landed: during
+    the post-sweep dedup spot-checks, or on the last planned service's own check. Those
+    checks only re-read days already fetched, so the checks stop but the stop alone does not
+    mark the result untrusted ("dedup spot-checks stopped ..." goes in its errors), and the
+    run writes as usual. A
+    throttle on a mismatch's re-ask (_source_agrees) still leaves the fetch untrusted.
     """
 
 
@@ -160,6 +248,12 @@ class _Budget:
         # (method, path) -> consecutive fully-throttled requests for that endpoint.
         self.throttles: dict[tuple[str, str], int] = {}
         self.throttled_total = 0  # every fully-throttled request this run; never cleared
+        # Every failed transport ATTEMPT this run (not 5xx); never cleared. See
+        # MAX_TRANSPORT_FAILURES_PER_RUN.
+        self.transport_failures = 0
+        # Seconds this run has lost to failed attempts of every kind and the waits after
+        # them; never cleared. See MAX_RETRY_SECONDS_PER_RUN.
+        self.retry_seconds = 0.0
         self._last = 0.0
 
     def configure(self, cap: int, delay: float):
@@ -170,6 +264,8 @@ class _Budget:
         self.made = 0
         self.throttles = {}
         self.throttled_total = 0
+        self.transport_failures = 0
+        self.retry_seconds = 0.0
 
     @staticmethod
     def _endpoint(method: str, url: str) -> tuple[str, str]:
@@ -209,6 +305,41 @@ class _Budget:
                 f"{len([k for k, v in self.throttles.items() if v])} endpoints) — Timely is "
                 f"throttling us broadly enough that the streak counter never trips. "
                 f"Stopping; the next run will retry.")
+
+    def transport_failed(self, method: str, url: str, failure: str):
+        """One ATTEMPT that got no response at all: a connection failure or a timeout.
+        Counts toward MAX_TRANSPORT_FAILURES_PER_RUN whether or not its request then
+        recovers. A 5xx attempt does not — see the note there."""
+        self.transport_failures += 1
+        if self.transport_failures >= MAX_TRANSPORT_FAILURES_PER_RUN:
+            verb, path = self._endpoint(method, url)
+            raise BudgetExhausted(
+                f"{self.transport_failures} connection failures/timeouts this run (last: "
+                f"{verb} {path}: {failure}) — each costs up to a 30s timeout plus "
+                f"backoff, so a run absorbing more risks outrunning its job timeout. "
+                f"Stopping; the next run will retry.")
+
+    def retry_cost(self, method: str, url: str, failure: str, *, spent: float,
+                   wait: float):
+        """Charge one failed attempt of ANY kind to the run-wide retry-time budget:
+        `spent`, the seconds the attempt itself took, plus `wait`, the backoff or
+        Retry-After we are about to sleep before the next attempt (0 after the last one).
+
+        Raises BudgetExhausted instead of letting that wait take the run past
+        MAX_RETRY_SECONDS_PER_RUN, so the run stops at the failure that would overspend
+        rather than after sleeping through it. Only the attempt itself, already spent
+        when this is called, can overshoot the budget — by at most one attempt's timeout.
+        """
+        self.retry_seconds += max(0.0, spent)
+        if self.retry_seconds + wait > MAX_RETRY_SECONDS_PER_RUN:
+            verb, path = self._endpoint(method, url)
+            raise BudgetExhausted(
+                f"{self.retry_seconds / 60:.0f} min of this run already went on failed "
+                f"attempts and the waits between retries (last: {verb} {path}: {failure}); "
+                f"waiting {wait:.0f}s more would pass the "
+                f"{MAX_RETRY_SECONDS_PER_RUN // 60}-min retry budget that keeps a run "
+                f"inside its job timeout. Stopping; the next run will retry.")
+        self.retry_seconds += wait
 
     def cleared(self, method: str, url: str):
         """A success only vouches for the endpoint it came from — see the note on
@@ -307,6 +438,18 @@ def _looks_like_empty_day(html: str) -> bool:
     return bool(_NO_TIMES_RE.search(html) or _DAY_HEADER_RE.search(html))
 
 
+def _on_service_selection_page(html: str) -> bool:
+    """Is this step 1 of the funnel — the service-selection form?
+
+    Keyed ONLY on that form's own fields (the service checkboxes and the ServiceStaffIds
+    hidden inputs), never on a /Booking/Service?obg= link: later pages link back to step
+    1, so keying on the link would refuse every advanced page. Both funnel POSTs use this
+    as their "did not advance" check; see the notes in select_service and select_staff
+    for what each can and cannot prove.
+    """
+    return bool(_SERVICE_STAFF_RE.search(html) or _SERVICE_RE.search(html))
+
+
 class TimelyClient:
     def __init__(self, cache=None, cache_ns=""):
         self.session = requests.Session()
@@ -330,7 +473,61 @@ class TimelyClient:
         backoff = 2.0
         for attempt in range(5):
             BUDGET.tick(extra_delay)
-            resp = self.session.request(method, url, data=data, headers=headers, timeout=30)
+            last = attempt == 4
+            # Measured from after the pacing sleep: what a FAILED attempt costs the run is
+            # charged to BUDGET.retry_cost() below, and pacing is spent either way.
+            started = time.monotonic()
+            try:
+                resp = self.session.request(method, url, data=data, headers=headers,
+                                            timeout=30)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                # A connection that fails before any response arrives (refused, reset, or
+                # closed before the status line) or a connect/read timeout is the most
+                # ordinary transient failure there is, and it used to escape on the FIRST
+                # attempt — only 429/5xx were retried. The 2026-09-05 run lost 4 lookups to
+                # "Read timed out. (read timeout=30)", each charged as a failed lookup
+                # (costing that stylist delete authority), and exited 1. So: the same
+                # backoff and the same 5-attempt limit as a 5xx. There is no Retry-After on
+                # a response we never received, so the plain backoff applies.
+                #
+                # Deliberately NOT reported to BUDGET.throttled(): the throttle stop
+                # conditions mean "Timely asked us to slow down", and a timeout says no
+                # such thing — at a streak of 3 and a run-wide total of 5, a few unlucky
+                # reads would abort a healthy sweep as untrusted. BUDGET.transport_failed()
+                # and BUDGET.retry_cost() count them instead, against limits sized for a
+                # network rather than a rate limiter, and raise BudgetExhausted when one
+                # trips. That is not optional: one request against a black-holed host now
+                # takes up to 5 x 30s + 30s of backoff instead of 30s, and without those
+                # stop conditions one hung endpoint pushed a deep sweep past the job's
+                # 120-min timeout (see MAX_TRANSPORT_FAILURES_PER_RUN). Short of them, a
+                # request that exhausts its attempts fails its one lookup (TimelyError, not
+                # BudgetExhausted), as one that exhausts them on 5xx does. Each attempt
+                # also still ticks the budget above, so these retries can never take the
+                # run past the request cap. Re-sending one of the two funnel POSTs books
+                # nothing — it re-selects the same service or staff on an anonymous session
+                # (docs/compliance.md) — and the "did not advance" checks in
+                # select_service/select_staff still vet whatever page the retry lands on.
+                #
+                # Only these two families (requests files SSLError and ProxyError under
+                # ConnectionError, so those retry too). NOT retried: a connection broken
+                # MID-BODY, after the status line arrived — requests raises
+                # ChunkedEncodingError ("Connection broken: IncompleteRead") for that,
+                # which is not a ConnectionError. Waiting might well fix it, but widening
+                # the retry set is a separate decision, so for now it fails its lookup on
+                # the first attempt exactly as before. The rest of what requests raises —
+                # an invalid url, a redirect loop — fails identically on every attempt, so
+                # retrying it would only spend requests.
+                failure = f"{type(e).__name__}: {e}"
+                BUDGET.transport_failed(method, url, failure)
+                wait = 0.0 if last else backoff
+                BUDGET.retry_cost(method, url, failure,
+                                  spent=time.monotonic() - started, wait=wait)
+                if last:
+                    raise RetriesExhausted(
+                        f"{method} {url} failed after 5 attempts: {failure}") from e
+                time.sleep(wait)
+                backoff *= 2
+                continue
             if resp.status_code in (429, 500, 502, 503, 504):
                 raw = resp.headers.get("Retry-After")
                 try:
@@ -350,14 +547,29 @@ class TimelyClient:
                         f"{resp.status_code} from {url} with Retry-After: {retry_after:.0f}s "
                         f"(> {MAX_RETRY_AFTER_SECONDS}s). Stopping rather than holding the "
                         f"job open or retrying sooner than asked; the next run will retry.")
-                if attempt == 4:
-                    if resp.status_code == 429:
-                        # Count the exhausted REQUEST, not each attempt: incrementing per
-                        # attempt made a single stubborn url trip the run-wide stop
-                        # condition by itself, and made this branch unreachable for 429.
-                        BUDGET.throttled(method, url)
-                    raise TimelyError(f"{resp.status_code} from {url} after retries")
-                wait = max(backoff, retry_after) if retry_after is not None else backoff
+                failure = f"HTTP {resp.status_code}"
+                if last and resp.status_code == 429:
+                    # Count the exhausted REQUEST, not each attempt: incrementing per
+                    # attempt made a single stubborn url trip the run-wide stop condition
+                    # by itself, and made this branch unreachable for 429.
+                    BUDGET.throttled(method, url)
+                if last:
+                    wait = 0.0
+                elif retry_after is not None:
+                    wait = max(backoff, retry_after)
+                else:
+                    wait = backoff
+                # Every failed attempt, 429 and 5xx alike, is charged to the run-wide
+                # retry-time budget: no counter bounds how long the Retry-After waits take,
+                # a 429 that recovers on a late attempt reaches no counter at all, and a
+                # 5xx reaches none ever — a request that ends on one fails its one lookup,
+                # like one that ends on a timeout. Its attempts are deliberately not
+                # transport failures: a 5xx arrives in a fraction of a second, so what it
+                # costs is time (MAX_TRANSPORT_FAILURES_PER_RUN, MAX_RETRY_SECONDS_PER_RUN).
+                BUDGET.retry_cost(method, url, failure,
+                                  spent=time.monotonic() - started, wait=wait)
+                if last:
+                    raise RetriesExhausted(f"{resp.status_code} from {url} after retries")
                 time.sleep(wait)
                 backoff *= 2
                 continue
@@ -396,16 +608,44 @@ class TimelyClient:
         # live funnel 2026-08-09: both are absent once it advances. A link back to
         # /Booking/Service?obg=... IS still present on the advanced page, so `_OBG_RE` must
         # NOT be used here — it would fail every service on every run.
-        if _SERVICE_STAFF_RE.search(html) or _SERVICE_RE.search(html):
+        if _on_service_selection_page(html):
             raise TimelyError(
                 "POST /Booking/Service came back on the service-selection page — the funnel "
                 "did not advance (session reset, or an edge interstitial). Refusing to read "
                 "availability from a session still parked at step 1.")
 
     def select_staff(self, staff_id: str):
-        self._request("POST", f"{BASE}/Booking/StaffSelection?obg={self.obg}",
-                      data={"SelectedStaffId": str(staff_id), "commit": ""},
-                      extra_delay=POST_EXTRA_DELAY_SECONDS)
+        html = self._request("POST", f"{BASE}/Booking/StaffSelection?obg={self.obg}",
+                             data={"SelectedStaffId": str(staff_id), "commit": ""},
+                             extra_delay=POST_EXTRA_DELAY_SECONDS)
+        # The same hole select_service closed, one step later, and it had no guard at all:
+        # if the session was reset between the two POSTs, this one lands back on step 1,
+        # GetOpenDates answers a well-formed empty {"openDates": []} for every stylist, and
+        # each lookup "succeeds" with zero openings while keeping delete authority.
+        #
+        # What this DOES detect: a reset to step 1, by the same service-form markup as
+        # above. The DateSelection page this POST 302s to has never been captured, so this
+        # rests on the pattern the step-2 capture shows
+        # (tests/fixtures/post_service_advanced_2026-08-09.html): Timely keeps a back-LINK
+        # to an earlier step but drops that step's form fields. Step 1's checkboxes and
+        # ServiceStaffIds inputs are already gone one step on; only step 1 itself would
+        # bring them back.
+        #
+        # What it does NOT detect, on purpose: this POST bouncing back to the staff page
+        # itself (a rejected SelectedStaffId), or an edge interstitial that is neither
+        # page. The staff page does have distinctive markup — `staff-selection-form`, the
+        # `SelectedStaffId` radios, a form posting to /Booking/StaffSelection — but nothing
+        # in this repo proves that markup is ABSENT from the DateSelection page. That same
+        # back-link pattern makes a /Booking/StaffSelection?obg= link there likely, and a
+        # "change stylist" control named SelectedStaffId is entirely plausible; a guard
+        # keyed on either would fail every lookup of every run and take the calendar
+        # down. Capture a live DateSelection response into tests/fixtures before adding a
+        # positive "advanced" check, or a "still on step 2" check, here.
+        if _on_service_selection_page(html):
+            raise TimelyError(
+                "POST /Booking/StaffSelection came back on the service-selection page — the "
+                "funnel did not advance (the session was reset to step 1). Refusing to read "
+                "availability from a session that has no service selected.")
 
     def open_dates(self, staff_id: str, month: int, year: int) -> list[dict]:
         url = (f"{BASE}/Booking/GetOpenDates?obg={self.obg}&month={month}&year={year}"
